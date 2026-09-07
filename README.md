@@ -1,4 +1,4 @@
-# Codex 自定义模型桥接 Skill
+# codex自定义模型桥接 skill
 
 [English](#english) | [中文说明](#中文说明)
 
@@ -12,7 +12,7 @@
 
 ### 📖 项目简介
 
-**Codex Autoheal Bridge** 是专为 **Codex Desktop** 和 **Codex CLI** 打造的智能多模型共存网关。
+**codex自定义模型桥接 skill**（Codex Autoheal Bridge）是专为 **Codex Desktop** 和 **Codex CLI** 打造的智能多模型共存网关。
 
 它打破了 Codex Desktop 只能绑定单一大模型 Provider 的限制，**支持一键将任何自定义模型添加至 Codex / GPT App 原生的模型选择列表中**。用户无需切换账号或新建会话，即可在**同一个对话窗口中自由无缝切换官方原生 GPT 与任意自定义添加的模型**（例如上一句用 GPT-5.6 构思架构，下一句切 DeepSeek 敲具体代码，再下一句切 Gemini 3.8 分析超长文档）。
 
