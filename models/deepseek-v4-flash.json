@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "slug": "deepseek-v4-flash",
+  "display_name": "DeepSeek V4 Flash",
+  "description": "OpenCode Go fast DeepSeek coding model through the local CLIProxyAPI Responses bridge.",
+  "template_slug": "gpt-5.6-sol",
+  "context_window": 1000000,
+  "effective_context_window_percent": 95,
+  "default_reasoning_level": "high",
+  "reasoning_efforts": ["low", "high", "max"],
+  "input_modalities": ["text"],
+  "supports_search_tool": false,
+  "priority": 60
+}

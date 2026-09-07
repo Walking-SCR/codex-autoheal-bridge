@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "slug": "grok-4.6",
+  "display_name": "Grok 4.6",
+  "description": "Grok 4.6 through the local CLIProxyAPI Responses bridge.",
+  "template_slug": "gpt-5.6-sol",
+  "context_window": 500000,
+  "effective_context_window_percent": 95,
+  "default_reasoning_level": "xhigh",
+  "reasoning_efforts": ["low", "medium", "high", "xhigh"],
+  "input_modalities": ["text", "image"],
+  "tool_mode": null,
+  "supports_search_tool": false,
+  "priority": 40
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Autoheal Bridge"
+  short_description: "Connect Google AI Pro quotas and DeepSeek API to Codex Desktop with auto-healing"
+  default_prompt: "Use $codex-autoheal-bridge to connect Google AI Pro and DeepSeek into Codex Desktop, route official GPT directly to OpenAI Native, and auto-heal OAuth tokens across sleep/reboot."

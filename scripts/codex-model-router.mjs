@@ -1,0 +1,782 @@
+#!/usr/bin/env node
+
+import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path, { extname } from "node:path";
+import http from "node:http";
+import https from "node:https";
+import net from "node:net";
+import os from "node:os";
+import tls from "node:tls";
+import { zstdCompressSync, zstdDecompressSync } from "node:zlib";
+import { URL } from "node:url";
+
+/**
+ * Model routing is intentionally centralized here.  A model selection must
+ * resolve provider, transport and upstream together for responses, compact
+ * and resume requests.
+ */
+export const ROUTE_TABLE = Object.freeze([
+  Object.freeze({
+    id: "openai-native",
+    provider: "openai",
+    transport: "native",
+    upstream: "gptNative",
+    matches: (model) => /^(?:gpt-|codex-|o[134](?:-|$))/i.test(model),
+  }),
+  Object.freeze({
+    id: "gemini-bridge",
+    provider: "gemini",
+    transport: "bridge",
+    upstream: "cliProxy",
+    matches: (model) => /^gemini-/i.test(model),
+  }),
+  Object.freeze({
+    id: "deepseek-bridge",
+    provider: "deepseek",
+    transport: "bridge",
+    upstream: "cliProxy",
+    matches: (model) => /^deepseek-/i.test(model),
+  }),
+  Object.freeze({
+    id: "claude-bridge",
+    provider: "claude",
+    transport: "bridge",
+    upstream: "cliProxy",
+    matches: (model) => /^claude-/i.test(model),
+  }),
+  Object.freeze({
+    id: "glm-bridge",
+    provider: "glm",
+    transport: "bridge",
+    upstream: "cliProxy",
+    matches: (model) => /^glm-/i.test(model),
+  }),
+  Object.freeze({
+    id: "thirdparty-bridge",
+    provider: "thirdparty",
+    transport: "bridge",
+    upstream: "cliProxy",
+    matches: (model) => /^(?:minimax|qwen-|kimi-|moonshot-|doubao-|baichuan-|yi-|llama-|mistral-)/i.test(model),
+  }),
+]);
+
+const DEFAULTS = Object.freeze({
+  listenHost: "127.0.0.1",
+  listenPort: 8318,
+  cliProxyBaseUrl: "http://127.0.0.1:8317",
+  gptNativeBaseUrl: "https://chatgpt.com/backend-api/codex",
+  authDir: `${process.env.HOME || process.env.USERPROFILE || os.homedir()}/.cli-proxy-api`,
+  helper: `${process.env.HOME || process.env.USERPROFILE || os.homedir()}/.config/codex-cli-proxy/read-client-key.py`,
+  helperPython: process.env.CODEX_BRIDGE_PYTHON || process.env.PYTHON || "python3",
+  requestTimeoutMs: 120_000,
+  disableGptWebSockets: true,
+  antigravityRefreshLeadMs: 5 * 60 * 1000,
+});
+
+function parsePort(value, fallback) {
+  const port = Number.parseInt(String(value ?? fallback), 10);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error(`Invalid port: ${value}`);
+  }
+  return port;
+}
+
+function parseDuration(value, fallback) {
+  const duration = Number.parseInt(String(value ?? fallback), 10);
+  if (!Number.isInteger(duration) || duration < 1) {
+    throw new Error(`Invalid duration: ${value}`);
+  }
+  return duration;
+}
+
+export function createConfig(env = process.env) {
+  return {
+    listenHost: env.CODEX_BRIDGE_LISTEN_HOST || DEFAULTS.listenHost,
+    listenPort: parsePort(env.CODEX_BRIDGE_LISTEN_PORT, DEFAULTS.listenPort),
+    cliProxyBaseUrl: env.CODEX_BRIDGE_CLIPROXY_BASE_URL || DEFAULTS.cliProxyBaseUrl,
+    gptNativeBaseUrl: env.CODEX_BRIDGE_GPT_NATIVE_BASE_URL || DEFAULTS.gptNativeBaseUrl,
+    authDir: env.CODEX_BRIDGE_AUTH_DIR || DEFAULTS.authDir,
+    helper: env.CODEX_BRIDGE_HELPER || DEFAULTS.helper,
+    helperPython: env.CODEX_BRIDGE_PYTHON || env.PYTHON || DEFAULTS.helperPython,
+    requestTimeoutMs: parseDuration(env.CODEX_BRIDGE_REQUEST_TIMEOUT_MS, DEFAULTS.requestTimeoutMs),
+    disableGptWebSockets: env.CODEX_BRIDGE_DISABLE_GPT_WS !== "false",
+    antigravityRefreshLeadMs: parseDuration(
+      env.CODEX_BRIDGE_ANTIGRAVITY_REFRESH_LEAD_MS,
+      DEFAULTS.antigravityRefreshLeadMs,
+    ),
+  };
+}
+
+export function resolveRoute(model) {
+  const normalized = String(model || "").trim();
+  if (!normalized) return null;
+  return ROUTE_TABLE.find((route) => route.matches(normalized)) || null;
+}
+
+const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
+const ANTIGRAVITY_CLIENT_ID =
+  process.env.ANTIGRAVITY_CLIENT_ID ||
+  Buffer.from("MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==", "base64").toString("utf-8");
+const ANTIGRAVITY_CLIENT_SECRET =
+  process.env.ANTIGRAVITY_CLIENT_SECRET ||
+  Buffer.from("R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=", "base64").toString("utf-8");
+
+const inFlightRefreshes = new Map();
+
+export async function requestGoogleTokenRefresh(refreshToken, options = {}) {
+  const tokenUrl = new URL(options.tokenEndpoint || GOOGLE_TOKEN_ENDPOINT);
+  const body = new URLSearchParams({
+    client_id: options.clientId || ANTIGRAVITY_CLIENT_ID,
+    client_secret: options.clientSecret || ANTIGRAVITY_CLIENT_SECRET,
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+  }).toString();
+
+  const reqImpl = options.requestImpl || ((target, reqOpts, cb) => {
+    return (target.protocol === "https:" ? https : http).request(target, reqOpts, cb);
+  });
+
+  return new Promise((resolve, reject) => {
+    const req = reqImpl(
+      tokenUrl,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          "content-length": String(Buffer.byteLength(body)),
+          "user-agent": "Go-http-client/2.0",
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        res.on("end", () => {
+          const raw = Buffer.concat(chunks).toString("utf8");
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            return reject(new Error(`Token refresh failed with status ${res.statusCode}: ${raw}`));
+          }
+          try {
+            resolve(JSON.parse(raw));
+          } catch (e) {
+            reject(new Error(`Failed to parse token response: ${e.message}`));
+          }
+        });
+      },
+    );
+    req.setTimeout(options.timeoutMs || 10_000, () => {
+      req.destroy(new Error("Token refresh timeout"));
+    });
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+
+export function isAuthExpiringSoon(authData, leadMs = 300_000, now = Date.now()) {
+  if (!authData || typeof authData !== "object") return false;
+  if (authData.expired) {
+    const expiry = new Date(authData.expired).getTime();
+    if (!Number.isNaN(expiry)) {
+      return expiry <= now + leadMs;
+    }
+  }
+  if (authData.timestamp && authData.expires_in) {
+    const expiry = authData.timestamp + authData.expires_in * 1000;
+    return expiry <= now + leadMs;
+  }
+  return false;
+}
+
+export async function refreshAntigravityAuthFile(filePath, options = {}) {
+  if (!fs.existsSync(filePath)) return false;
+
+  let raw;
+  try {
+    raw = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return false;
+  }
+
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+
+  if (data?.type !== "antigravity" || !data?.refresh_token) {
+    return false;
+  }
+
+  const leadMs = options.leadMs ?? (5 * 60 * 1000);
+  if (!isAuthExpiringSoon(data, leadMs, options.now)) {
+    return true;
+  }
+
+  if (inFlightRefreshes.has(filePath)) {
+    return inFlightRefreshes.get(filePath);
+  }
+
+  const task = (async () => {
+    let lastError = null;
+    const maxRetries = options.maxRetries ?? 3;
+    const retryDelayMs = options.retryDelayMs ?? 1000;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const tokenResp = await requestGoogleTokenRefresh(data.refresh_token, options);
+        if (tokenResp?.access_token) {
+          data.access_token = tokenResp.access_token;
+          if (tokenResp.refresh_token) {
+            data.refresh_token = tokenResp.refresh_token;
+          }
+          data.expires_in = tokenResp.expires_in || 3599;
+          data.timestamp = Date.now();
+          data.expired = new Date(Date.now() + data.expires_in * 1000).toISOString();
+          data.disabled = false;
+
+          fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf8");
+
+          if (options.log) {
+            options.log(`[router] event=antigravity_auto_refreshed file=${filePath} expires_in=${data.expires_in}`);
+          }
+          return "refreshed";
+        }
+      } catch (err) {
+        lastError = err;
+        if (options.log) {
+          options.log(`[router] event=antigravity_refresh_retry attempt=${attempt} error=${err.message}`);
+        }
+        if (attempt < maxRetries) {
+          await new Promise((r) => setTimeout(r, retryDelayMs));
+        }
+      }
+    }
+    if (options.log) {
+      options.log(`[router] event=antigravity_refresh_failed file=${filePath} error=${lastError?.message}`);
+    }
+    return false;
+  })();
+
+  inFlightRefreshes.set(filePath, task);
+  try {
+    return await task;
+  } finally {
+    inFlightRefreshes.delete(filePath);
+  }
+}
+
+export async function ensureAntigravityAuthReady(authDir, options = {}) {
+  if (!authDir || !fs.existsSync(authDir)) return false;
+  try {
+    const files = fs.readdirSync(authDir);
+    const antigravityFiles = files
+      .filter((f) => f.startsWith("antigravity-") && f.endsWith(".json"))
+      .map((f) => path.join(authDir, f));
+
+    if (antigravityFiles.length === 0) return true;
+    const results = await Promise.all(antigravityFiles.map((f) => refreshAntigravityAuthFile(f, options)));
+    if (results.some((r) => r === "refreshed")) {
+      const syncDelayMs = options.syncDelayMs ?? 300;
+      await new Promise((resolve) => setTimeout(resolve, syncDelayMs));
+    }
+    return true;
+  } catch (err) {
+    if (options.log) {
+      options.log(`[router] event=antigravity_scan_error error=${err.message}`);
+    }
+    return false;
+  }
+}
+function firstHeader(headers, names) {
+  for (const name of names) {
+    const value = headers[name] ?? headers[name.toLowerCase()];
+    if (value !== undefined && value !== "") return Array.isArray(value) ? value[0] : value;
+  }
+  return undefined;
+}
+
+function parseRoutingHint(value) {
+  if (!value) return undefined;
+  const match = String(value).match(/(?:^|[;,\s])model=([^;,\s]+)/i);
+  return match?.[1];
+}
+
+function parseJsonModel(body) {
+  if (!body || body.length === 0) return undefined;
+  const contentType = String(body.headers?.["content-type"] || "");
+  if (body instanceof Buffer && contentType.includes("application/json")) {
+    try {
+      const json = JSON.parse(body.toString("utf8"));
+      return json?.model || json?.request?.model;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+export function extractModel(headers, bodyBuffer) {
+  const hinted = parseRoutingHint(firstHeader(headers, ["x-codex-routing-hint"]));
+  if (hinted) return hinted;
+  const direct = firstHeader(headers, ["x-codex-model", "x-model"]);
+  if (direct) return direct;
+  if (bodyBuffer?.length) {
+    try {
+      const json = JSON.parse(bodyBuffer.toString("utf8"));
+      return json?.model || json?.request?.model;
+    } catch {
+      // Codex may use zstd for the request body.  The routing hint above is
+      // present on those requests; do not guess a provider when it is absent.
+    }
+  }
+  return undefined;
+}
+
+function parseTurnMetadata(headers) {
+  const raw = firstHeader(headers, ["x-codex-turn-metadata"]);
+  if (!raw) return {};
+  try {
+    const metadata = JSON.parse(raw);
+    return {
+      operation: metadata.request_kind || metadata.operation,
+      threadId: metadata.thread_id || metadata.threadId,
+      sessionId: metadata.session_id || metadata.sessionId,
+    };
+  } catch {
+    return {};
+  }
+}
+
+export function classifyOperation(request) {
+  const metadata = parseTurnMetadata(request.headers);
+  if (metadata.operation) {
+    const normalized = String(metadata.operation).toLowerCase();
+    if (normalized.includes("compact")) return "compact";
+    if (normalized.includes("resume")) return "resume";
+    return "responses";
+  }
+  const path = String(request.url || "").toLowerCase();
+  if (path.includes("compact")) return "compact";
+  if (path.includes("resume")) return "resume";
+  return "responses";
+}
+
+function safeId(value) {
+  if (value === undefined || value === null || value === "") return "-";
+  return String(value).replace(/[\r\n\t ]+/g, "_").slice(0, 160);
+}
+
+export function requestContext(request, model, route) {
+  const metadata = parseTurnMetadata(request.headers);
+  return {
+    requestId:
+      firstHeader(request.headers, ["x-request-id", "x-codex-request-id"]) || randomUUID(),
+    threadId:
+      metadata.threadId || firstHeader(request.headers, ["x-codex-thread-id", "x-thread-id"]),
+    sessionId:
+      metadata.sessionId || firstHeader(request.headers, ["x-codex-session-id", "x-session-id"]),
+    model: model || "-",
+    provider: route?.provider || "-",
+    transport: route?.transport || "-",
+    upstream: route?.upstream || "-",
+    operation: classifyOperation(request),
+  };
+}
+
+export function formatRouterLog(context, event = "route") {
+  return [
+    "[router]",
+    `event=${safeId(event)}`,
+    `request_id=${safeId(context.requestId)}`,
+    `thread_id=${safeId(context.threadId)}`,
+    `session_id=${safeId(context.sessionId)}`,
+    `model=${safeId(context.model)}`,
+    `provider=${safeId(context.provider)}`,
+    `transport=${safeId(context.transport)}`,
+    `upstream=${safeId(context.upstream)}`,
+    `operation=${safeId(context.operation)}`,
+  ].join(" ");
+}
+
+function helperCommand(config) {
+  if (process.env.CODEX_BRIDGE_HELPER_CMD) {
+    let extra = [];
+    const raw = process.env.CODEX_BRIDGE_HELPER_ARGS || "";
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        extra = Array.isArray(parsed) ? parsed.map(String) : [];
+      } catch {
+        extra = raw.split("\0").filter(Boolean);
+      }
+    }
+    return [process.env.CODEX_BRIDGE_HELPER_CMD, ...extra, config.helper];
+  }
+  if (extname(config.helper).toLowerCase() === ".py") {
+    return [config.helperPython, config.helper];
+  }
+  return [process.env.CODEX_BRIDGE_RUBY || "ruby", config.helper];
+}
+
+export function readClientKey(config) {
+  const [command, ...args] = helperCommand(config);
+  const value = execFileSync(command, args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: 5_000,
+  }).trim();
+  if (!value) throw new Error("CLIProxyAPI client key helper returned no value");
+  return value;
+}
+
+function hopByHopHeaders(headers) {
+  const excluded = new Set([
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+  ]);
+  return Object.fromEntries(
+    Object.entries(headers).filter(([name]) => !excluded.has(name.toLowerCase())),
+  );
+}
+
+function hostHeader(url) {
+  return url.port ? `${url.hostname}:${url.port}` : url.hostname;
+}
+
+export function upstreamTarget(route, config, requestPath) {
+  const base = new URL(route.upstream === "gptNative" ? config.gptNativeBaseUrl : config.cliProxyBaseUrl);
+  const incoming = new URL(requestPath || "/", "http://bridge.invalid");
+  const suffix = route.upstream === "gptNative"
+    ? incoming.pathname.replace(/^\/v1(?=\/|$)/, "") || "/"
+    : incoming.pathname;
+  base.pathname = `${base.pathname.replace(/\/$/, "")}${suffix}`;
+  base.search = incoming.search;
+  return base;
+}
+
+function isForeignEncryptedContent(value, targetProvider) {
+  if (typeof value !== "string" || value.length === 0) return false;
+  const isGeminiCarrier = value.startsWith("cpa-gemini-responses-carrier-v1:");
+  return targetProvider === "openai" ? isGeminiCarrier : !isGeminiCarrier;
+}
+
+function containsForeignEncryptedContent(value, targetProvider) {
+  if (Array.isArray(value)) return value.some((item) => containsForeignEncryptedContent(item, targetProvider));
+  if (!value || typeof value !== "object") return false;
+  if (isForeignEncryptedContent(value.encrypted_content, targetProvider)) return true;
+  return Object.values(value).some((item) => containsForeignEncryptedContent(item, targetProvider));
+}
+
+function scrubForeignEncryptedContent(value, targetProvider) {
+  if (Array.isArray(value)) {
+    return value
+      .filter((item) => !(item?.type === "reasoning" && containsForeignEncryptedContent(item, targetProvider)))
+      .map((item) => scrubForeignEncryptedContent(item, targetProvider));
+  }
+  if (!value || typeof value !== "object") return value;
+  const result = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key === "encrypted_content" && isForeignEncryptedContent(item, targetProvider)) continue;
+    result[key] = scrubForeignEncryptedContent(item, targetProvider);
+  }
+  return result;
+}
+
+export function sanitizeBodyForRoute(bodyBuffer, requestHeaders, route) {
+  const contentType = String(requestHeaders["content-type"] || "");
+  if (!bodyBuffer?.length || !contentType.includes("application/json")) {
+    return { buffer: bodyBuffer, changed: false };
+  }
+  const encoding = String(requestHeaders["content-encoding"] || "").toLowerCase();
+  let decoded = bodyBuffer;
+  try {
+    if (encoding === "zstd") decoded = zstdDecompressSync(bodyBuffer);
+    const payload = JSON.parse(decoded.toString("utf8"));
+    if (!containsForeignEncryptedContent(payload, route.provider)) {
+      return { buffer: bodyBuffer, changed: false };
+    }
+    const sanitized = scrubForeignEncryptedContent(payload, route.provider);
+    if (sanitized && typeof sanitized === "object" && !Array.isArray(sanitized)) {
+      delete sanitized.previous_response_id;
+    }
+    let output = Buffer.from(JSON.stringify(sanitized));
+    if (encoding === "zstd") output = zstdCompressSync(output);
+    return { buffer: output, changed: true };
+  } catch {
+    // Never guess or corrupt an opaque request.  The route remains explicit;
+    // Codex/upstream will return the original protocol error if it is opaque.
+    return { buffer: bodyBuffer, changed: false };
+  }
+}
+
+function headersForRoute(route, request, config, target) {
+  const headers = hopByHopHeaders(request.headers);
+  headers.host = hostHeader(target);
+  if (route.upstream === "cliProxy") {
+    headers.authorization = `Bearer ${readClientKey(config)}`;
+  }
+  return headers;
+}
+
+function collectBody(request) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    request.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    request.on("end", () => resolve(Buffer.concat(chunks)));
+    request.on("error", reject);
+  });
+}
+
+function responseJson(response, status, payload) {
+  if (response.headersSent) {
+    response.destroy();
+    return;
+  }
+  response.writeHead(status, { "content-type": "application/json" });
+  response.end(JSON.stringify(payload));
+}
+
+function publicError(error, context) {
+  return {
+    error: "upstream_unavailable",
+    message: `${context.provider} upstream unavailable`,
+    request_id: context.requestId,
+    provider: context.provider,
+    model: context.model,
+    cause: error?.code || error?.message || "request_failed",
+  };
+}
+
+function requestModule(target) {
+  return target.protocol === "https:" ? https : http;
+}
+
+export function createRouterServer(options = {}) {
+  const config = { ...createConfig(), ...options.config };
+  const log = options.log || ((line) => process.stderr.write(`${line}\n`));
+  const requestImpl = options.requestImpl || ((target, requestOptions, callback) => {
+    return requestModule(target).request(target, requestOptions, callback);
+  });
+
+  async function handleRequest(request, response) {
+    if (request.url === "/__codex_bridge_health") {
+      responseJson(response, 200, {
+        status: "ok",
+        router: "model-aware",
+        routes: ROUTE_TABLE.map(({ id, provider, transport, upstream }) => ({
+          id,
+          provider,
+          transport,
+          upstream,
+        })),
+        upstreams: {
+          gptNative: config.gptNativeBaseUrl,
+          cliProxy: config.cliProxyBaseUrl,
+        },
+      });
+      return;
+    }
+
+    if (request.url.startsWith("/__sse_shim/")) {
+      const rawTarget = request.url.slice("/__sse_shim/".length);
+      let targetUrl;
+      try {
+        targetUrl = new URL(rawTarget.startsWith("http") ? rawTarget : `https://${rawTarget}`);
+      } catch (err) {
+        responseJson(response, 400, { error: "invalid_shim_target", message: err.message });
+        return;
+      }
+
+      const headers = hopByHopHeaders(request.headers);
+      headers.host = hostHeader(targetUrl);
+      delete headers["content-length"];
+
+      const client = targetUrl.protocol === "https:" ? https : http;
+      const upstream = client.request(targetUrl, {
+        method: request.method,
+        headers,
+      }, (upRes) => {
+        response.writeHead(upRes.statusCode || 502, upRes.headers);
+        let sawDone = false;
+        const isSse = String(upRes.headers["content-type"] || "").includes("text/event-stream");
+
+        upRes.on("data", (chunk) => {
+          const str = chunk.toString("utf8");
+          if (str.includes("[DONE]")) sawDone = true;
+          response.write(chunk);
+        });
+
+        upRes.on("end", () => {
+          if (isSse && !sawDone) {
+            response.write("\ndata: [DONE]\n\n");
+          }
+          response.end();
+        });
+      });
+
+      upstream.on("error", (err) => {
+        if (!response.headersSent) {
+          responseJson(response, 502, { error: "upstream_shim_error", message: err.message });
+        } else {
+          response.destroy();
+        }
+      });
+
+      request.pipe(upstream);
+      return;
+    }
+
+    let body;
+    try {
+      body = await collectBody(request);
+    } catch (error) {
+      responseJson(response, 400, { error: "request_body_unreadable", cause: error.message });
+      return;
+    }
+
+    const model = extractModel(request.headers, body);
+    const route = resolveRoute(model);
+    const context = requestContext(request, model, route);
+    log(formatRouterLog(context));
+
+    if (!route) {
+      responseJson(response, 400, {
+        error: "model_route_not_found",
+        message: "Model is required and must match an explicit router route",
+        request_id: context.requestId,
+      });
+      return;
+    }
+
+    if (route.provider === "gemini" || route.provider === "claude") {
+      try {
+        await ensureAntigravityAuthReady(config.authDir, {
+          tokenEndpoint: options.tokenEndpoint,
+          clientId: options.clientId,
+          clientSecret: options.clientSecret,
+          leadMs: config.antigravityRefreshLeadMs,
+          log,
+          requestImpl,
+        });
+      } catch (err) {
+        log(`[router] event=antigravity_preflight_error error=${err?.message || err}`);
+      }
+    }
+
+    let target;
+    let headers;
+    try {
+      target = upstreamTarget(route, config, request.url);
+      headers = headersForRoute(route, request, config, target);
+    } catch (error) {
+      log(formatRouterLog(context, "route_error"));
+      responseJson(response, 502, publicError(error, context));
+      return;
+    }
+
+    const prepared = sanitizeBodyForRoute(body, request.headers, route);
+    if (prepared.changed) {
+      headers["content-length"] = String(prepared.buffer.length);
+    }
+    const requestOptions = {
+      method: request.method,
+      path: `${target.pathname}${target.search}`,
+      headers,
+    };
+    const upstreamRequest = requestImpl(target, requestOptions, (upstreamResponse) => {
+      response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
+      upstreamResponse.pipe(response);
+    });
+    upstreamRequest.setTimeout(config.requestTimeoutMs, () => upstreamRequest.destroy(new Error("upstream_timeout")));
+    upstreamRequest.on("error", (error) => {
+      log(formatRouterLog(context, "upstream_error"));
+      responseJson(response, 502, publicError(error, context));
+    });
+    upstreamRequest.end(prepared.buffer);
+  }
+
+  const server = http.createServer((request, response) => {
+    void handleRequest(request, response);
+  });
+
+  server.on("upgrade", (request, socket, head) => {
+    const model = parseRoutingHint(firstHeader(request.headers, ["x-codex-routing-hint"])) ||
+      firstHeader(request.headers, ["x-codex-model", "x-model"]);
+    const route = resolveRoute(model);
+    const context = requestContext(request, model, route);
+    log(formatRouterLog(context, "upgrade"));
+    if (!route) {
+      socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    if (route.upstream === "gptNative" && config.disableGptWebSockets) {
+      log(formatRouterLog(context, "gpt_ws_disabled"));
+      socket.end("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    if (route.provider === "gemini" || route.provider === "claude") {
+      try {
+        void ensureAntigravityAuthReady(config.authDir, {
+          tokenEndpoint: options.tokenEndpoint,
+          clientId: options.clientId,
+          clientSecret: options.clientSecret,
+          leadMs: config.antigravityRefreshLeadMs,
+          log,
+        });
+      } catch (err) {
+        log(`[router] event=antigravity_preflight_upgrade_error error=${err?.message || err}`);
+      }
+    }
+    let target;
+    try {
+      target = upstreamTarget(route, config, request.url);
+      const headers = headersForRoute(route, request, config, target);
+      const port = target.port ? Number(target.port) : target.protocol === "https:" ? 443 : 80;
+      const connection = target.protocol === "https:"
+        ? tls.connect({ host: target.hostname, port, servername: target.hostname })
+        : net.connect(port, target.hostname);
+      const connectedEvent = target.protocol === "https:" ? "secureConnect" : "connect";
+      connection.once(connectedEvent, () => {
+        const lines = [`${request.method} ${target.pathname}${target.search} HTTP/${request.httpVersion}`];
+        for (const [name, value] of Object.entries({ ...headers, connection: "Upgrade", upgrade: "websocket" })) {
+          lines.push(`${name}: ${value}`);
+        }
+        lines.push("", "");
+        connection.write(lines.join("\r\n"));
+        if (head?.length) connection.write(head);
+        socket.pipe(connection).pipe(socket);
+      });
+      connection.on("error", () => socket.destroy());
+    } catch {
+      socket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+    }
+  });
+
+  return server;
+}
+
+export function startRouter(options = {}) {
+  const config = options.config || createConfig();
+  const server = options.server || createRouterServer({ ...options, config });
+  server.listen(config.listenPort, config.listenHost, () => {
+    process.stdout.write(
+      `Codex model router listening on http://${config.listenHost}:${config.listenPort}/v1\n`,
+    );
+  });
+  const shutdown = () => server.close(() => process.exit(0));
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+  return server;
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  startRouter();
+}

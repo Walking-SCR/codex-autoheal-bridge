@@ -1,0 +1,25 @@
+{
+  "skill_name": "codex-cli-model-bridge",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "把 CLIProxyAPI 里的 Grok 4.6 和 DeepSeek V4 Pro 加到 Codex 模型列表，保留我已有的 MCP 和默认模型。",
+      "expected_output": "Audits thread-provider continuity first, preserves the OpenAI desktop default, writes the proxy into an isolated profile, syncs its managed catalog, probes with codex exec, and reports backups."
+    },
+    {
+      "id": 2,
+      "prompt": "Codex 里的第三方模型更新后不见了，帮我修复，但不要动 WorkBuddy。",
+      "expected_output": "Diagnoses Provider/catalog consumption and indexed thread-provider distribution, restores the dominant history Provider, and keeps third-party routing isolated in a profile."
+    },
+    {
+      "id": 3,
+      "prompt": "给 Codex 的 GPT-5.6 Sol 增加一个 Fast 模型选项。",
+      "expected_output": "Uses Codex service_tier=fast and verifies priority semantics instead of creating a cosmetic duplicate model."
+    },
+    {
+      "id": 4,
+      "prompt": "把 GLM Coding Plan 的 GLM 5.3 接到 Codex，和现有 GPT、Grok、DeepSeek 一起出现，不要覆盖默认 Provider。",
+      "expected_output": "Keeps model_provider=openai, uses Codex Router zai-coding when Desktop is on port 4202, refuses the vendor config.toml overwrite, and live-tests zai-coding/glm-5.3."
+    }
+  ]
+}
