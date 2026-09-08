@@ -148,7 +148,7 @@ python %USERPROFILE%\.codex\skills\codex-autoheal-bridge\scripts\bridge.py confi
 
 **真实自然语言示例：**
 
-> “使用 `$codex-autoheal-bridge` 帮我把这个中转站的模型加进下拉菜单：地址是 https://router.yingyueai.com/chatrouter/v1/chat/completions，模型名是 glm-5.2，key 是 sk-your-api-key-here，确保不要动其他模型。”
+> “使用 `$codex-autoheal-bridge` 帮我把这个中转站的模型加进下拉菜单：地址是 https://api.your-relay-service.com/v1/chat/completions，模型名是 glm-5.2，key 是 <你的API_KEY>，确保不要动其他模型。”
 
 ---
 
@@ -166,7 +166,7 @@ python3 ~/.codex/skills/codex-autoheal-bridge/scripts/bridge.py add-model \
 # 示例 1：添加智谱 GLM-5.2
 python3 ~/.codex/skills/codex-autoheal-bridge/scripts/bridge.py add-model \
   --model "glm-5.2" \
-  --base-url "https://router.yingyueai.com/chatrouter/v1" \
+  --base-url "https://api.your-relay-service.com/v1" \
   --api-key "sk-..." \
   --apply
 
@@ -199,7 +199,7 @@ host: "127.0.0.1"
 port: 8317
 auth-dir: "~/.cli-proxy-api"
 api-keys:
-  - "sk-codex-local-bridge-20260906-4d91a1b8f0e74c5d8a2f6b3e1c9d7a5f"
+  - "sk-your-custom-proxy-key"
 
 openai-compatibility:
   - name: "deepseek"
@@ -235,7 +235,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zhijian.codex-cli-mo
 ```toml
 model_provider = "openai"
 openai_base_url = "http://127.0.0.1:8318/v1"
-model_catalog_json = "/Users/scr/.codex/model-catalog-cli-proxy.bridge-test.json"
+model_catalog_json = "~/.codex/model-catalog-cli-proxy.json"
 ```
 
 #### 步骤 4：完全重启 Codex Desktop
