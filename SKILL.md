@@ -50,6 +50,20 @@ Examples below use `python3`. Substitute `<python>` when that command is missing
 
 ## Default workflow
 
+### 0. 启动交互确认操作系统（Mandatory OS Confirmation Gate）
+
+**在执行任何环境检测、审计、配置或后台服务部署之前，必须先明确向用户确认本地操作系统环境：**
+
+- 主动向用户发起一次简明确认：
+  > “在开始配置前，请确认您当前运行的本地系统环境：  
+  > 1. **macOS**  
+  > 2. **Windows**”
+- **免二次确认例外**：如果用户在初始提示词中已明确声明了操作系统（如“我在 Windows 电脑上”、“我是 Mac 系统”），则视为已确认，无需重复询问。
+- **未确认操作系统之前，严禁直接执行写入或系统配置命令。**
+- 确认系统后，按对应平台的最佳方案执行：
+  - **macOS**：执行 LaunchAgent 开机自启守护（调用 `/bin/launchctl` 管理，指定 `--platform darwin`）。
+  - **Windows**：执行 Windows 最佳实践方案，生成无黑框静默运行脚本（`run-router-hidden.vbs`）并写入用户自启目录（`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\codex-model-router.vbs`），彻底避免黑框闪烁与误关问题（指定 `--platform windows`）。
+
 ### 1. Audit before mutation
 
 ```bash
@@ -134,18 +148,22 @@ When onboarding a new model, read [model-manifests.md](references/model-manifest
 
 ### 5. Enable transparent Desktop coexistence
 
-Skip this on Windows unless the user explicitly wants the normal Desktop picker and will keep a Node process running. Isolated profile is enough.
+支持 macOS 与 Windows 两种操作系统的原生无感后台自愈常驻：
 
-First preview the exact root config diff and history guard:
+- **macOS**：自动生成并加载 `~/Library/LaunchAgents/com.zhijian.codex-cli-model-bridge-router.plist`
+- **Windows**：自动在 `%USERPROFILE%\.config\codex-cli-model-bridge\` 生成 `run-router.cmd` 和 `run-router-hidden.vbs`，并静默注册进用户的自启目录（`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\codex-model-router.vbs`），彻底解决黑框控制台闪烁与误关问题。
+
+First preview the exact root config diff and history guard (带确认后的平台参数):
 
 ```bash
-python3 <skill-dir>/scripts/bridge.py configure-desktop
+python3 <skill-dir>/scripts/bridge.py configure-desktop --platform <darwin|windows>
 ```
 
 After the finding-level diff is authorized, apply with the reported SHA-256:
 
 ```bash
 python3 <skill-dir>/scripts/bridge.py configure-desktop \
+  --platform <darwin|windows> \
   --expected-sha256 <approved-sha256> \
   --apply
 ```
@@ -154,6 +172,7 @@ The command refuses to proceed unless `openai` owns the majority of indexed hist
 
 - `~/.config/codex-cli-model-bridge/codex-model-router.mjs`, owner-executable
 - on macOS, `~/Library/LaunchAgents/com.zhijian.codex-cli-model-bridge-router.plist`
+- on Windows, `run-router.cmd` and `run-router-hidden.vbs` with startup entry in `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\codex-model-router.vbs`
 - unloads legacy `com.zhijian.codex-cli-model-bridge-transparent-proxy` if present
 - a listener on `127.0.0.1:8318` that routes GPT to OpenAI Native and third-party models to CLIProxyAPI on `127.0.0.1:8317` with built-in OAuth token self-healing
 

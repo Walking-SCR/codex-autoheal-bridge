@@ -96,23 +96,29 @@ git clone https://github.com/<your-username>/codex-autoheal-bridge.git ~/.codex/
 > **推荐话术 2（专配 Google AI Pro 额度）**：
 > “使用 `$codex-autoheal-bridge` 帮我一键配置 Google AI Pro (Gemini 3.8/3.7/3.6/3.1) 系列模型接入”
 
-*(触发机制说明：只要在你的输入中包含 `$codex-autoheal-bridge` 标签，Codex 调度器就会必定激活本 Skill，自动执行环境审计、安装 8318 自愈路由、加载后台守护进程并安全写入配置。完成后只需按 `Cmd + Q` 重启 Codex Desktop 即可直接使用！)*
+*(触发机制说明：只要在你的输入中包含 `$codex-autoheal-bridge` 标签，Codex 调度器就会必定激活本 Skill。Skill 启动时会**首先提示你确认当前操作系统（macOS / Windows）**，确认后自动执行环境审计、部署对应系统的无感后台自愈网关并安全写入配置。完成后只需重启 Codex Desktop 即可直接使用！)*
 
 #### 选项 B：在终端运行一行命令一键配置
 
+**macOS 环境：**
 ```bash
-python3 ~/.codex/skills/codex-autoheal-bridge/scripts/bridge.py configure-desktop --apply
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/bridge.py configure-desktop --platform darwin --apply
 ```
 
-该命令会自动完成：
+**Windows 环境：**
+```bash
+python %USERPROFILE%\.codex\skills\codex-autoheal-bridge\scripts\bridge.py configure-desktop --platform windows --apply
+```
 
-1. 校验账号与历史会话完整性；
-2. 自动安装 `com.zhijian.codex-cli-model-bridge-router.plist` 守护进程并启动；
-3. 自动卸载并清理废弃的旧版透明代理；
-4. 安全备份并在 `~/.codex/config.toml` 中配置好路由地址与模型表；
-5. 自动完成连通性探测验收。
+该命令会自动完成跨平台无感常驻：
 
-完成后按 `Cmd + Q` 重启 Codex Desktop 即可生效。
+1. **操作系统自适应**：macOS 自动注册 `LaunchAgent` 系统守护；Windows 自动生成无黑框静默运行脚本（`run-router-hidden.vbs`）并写入开机自启目录（`Startup`），彻底杜绝控制台黑框闪烁与误关；
+2. **环境校验**：校验账号与历史会话完整性，确保官方 GPT 历史不丢失；
+3. **自愈网关部署**：安装 8318 自愈路由器并自动启动；
+4. **安全配置写入**：安全备份并在 `config.toml` 中配置好路由地址与原生模型目录；
+5. **连通性验收**：自动完成双模探针与连通性测试。
+
+完成后重启 Codex Desktop 即可生效。
 
 ---
 

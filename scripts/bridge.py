@@ -758,6 +758,111 @@ def start_detached_proxy(
     return None
 
 
+def default_windows_startup_dir() -> Path:
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+    return Path("~").expanduser() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+
+
+def windows_runner_cmd_source(
+    node: Path,
+    runtime: Path,
+    helper: Path,
+    transparent_url: str,
+    upstream_url: str,
+    disable_gpt_ws: bool = True,
+) -> str:
+    transparent = urllib.parse.urlparse(transparent_url)
+    upstream = urllib.parse.urlparse(upstream_url)
+    command, helper_args = helper_invocation(helper)
+    args_json = json.dumps(helper_args[:-1])
+    ws_flag = "true" if disable_gpt_ws else "false"
+    return (
+        "@echo off\r\n"
+        f'set "CODEX_BRIDGE_HELPER={helper}"\r\n'
+        f'set "CODEX_BRIDGE_HELPER_CMD={command}"\r\n'
+        f'set "CODEX_BRIDGE_HELPER_ARGS={args_json}"\r\n'
+        'set "CODEX_BRIDGE_LISTEN_HOST=127.0.0.1"\r\n'
+        f'set "CODEX_BRIDGE_LISTEN_PORT={transparent.port or 8318}"\r\n'
+        f'set "CODEX_BRIDGE_CLIPROXY_BASE_URL=http://127.0.0.1:{upstream.port or 8317}"\r\n'
+        f'set "CODEX_BRIDGE_DISABLE_GPT_WS={ws_flag}"\r\n'
+        f'"{node}" "{runtime}"\r\n'
+    )
+
+
+def windows_hidden_vbs_source(target_cmd_path: Path) -> str:
+    return (
+        'Set WshShell = CreateObject("WScript.Shell")\r\n'
+        f'WshShell.Run Chr(34) & "{target_cmd_path}" & Chr(34), 0, False\r\n'
+        'Set WshShell = Nothing\r\n'
+    )
+
+
+def setup_windows_proxy_files(
+    node: Path,
+    runtime: Path,
+    helper: Path,
+    transparent_url: str,
+    upstream_url: str,
+    state_dir: Path,
+    startup_dir: Path | None = None,
+) -> dict[str, Path | None]:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    cmd_path = state_dir / "run-router.cmd"
+    vbs_path = state_dir / "run-router-hidden.vbs"
+
+    cmd_content = windows_runner_cmd_source(node, runtime, helper, transparent_url, upstream_url)
+    atomic_write(cmd_path, cmd_content, 0o700)
+
+    vbs_content = windows_hidden_vbs_source(cmd_path)
+    atomic_write(vbs_path, vbs_content, 0o700)
+
+    target_startup = startup_dir or default_windows_startup_dir()
+    startup_vbs: Path | None = None
+    try:
+        target_startup.mkdir(parents=True, exist_ok=True)
+        startup_vbs = target_startup / "codex-model-router.vbs"
+        startup_content = windows_hidden_vbs_source(vbs_path)
+        atomic_write(startup_vbs, startup_content, 0o700)
+    except OSError:
+        pass
+
+    return {
+        "cmd": cmd_path,
+        "vbs": vbs_path,
+        "startup": startup_vbs,
+    }
+
+
+def start_windows_proxy(vbs_path: Path) -> str | None:
+    try:
+        wscript = shutil.which("wscript.exe") or shutil.which("wscript") or "wscript.exe"
+        subprocess.Popen(
+            [wscript, str(vbs_path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+    except OSError as exc:
+        return f"failed to start Windows transparent proxy: {type(exc).__name__}"
+    return None
+
+
+def stop_launch_agent(path: Path) -> None:
+    if platform.system() != "Darwin":
+        return
+    domain = f"gui/{os.getuid()}"
+    subprocess.run(
+        ["/bin/launchctl", "bootout", domain, str(path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
 def start_transparent_proxy(
     node: Path,
     runtime: Path,
@@ -765,8 +870,11 @@ def start_transparent_proxy(
     transparent_url: str,
     upstream_url: str,
     launch_agent_path: Path,
-) -> str | None:
-    if platform.system() == "Darwin":
+    target_platform: str = "Darwin",
+    startup_dir: Path | None = None,
+    skip_live_start: bool = False,
+) -> tuple[str | None, dict[str, str]]:
+    if target_platform == "Darwin":
         if LEGACY_TRANSPARENT_LAUNCH_AGENT.exists():
             stop_launch_agent(LEGACY_TRANSPARENT_LAUNCH_AGENT)
         launch_agent_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -775,8 +883,31 @@ def start_transparent_proxy(
             launch_agent_source(node, runtime, helper, transparent_url, upstream_url),
             0o600,
         )
-        return start_launch_agent(launch_agent_path)
-    return start_detached_proxy(node, runtime, helper, transparent_url, upstream_url)
+        meta = {"platform": "darwin", "launch_agent": str(launch_agent_path)}
+        if skip_live_start:
+            return None, meta
+        return start_launch_agent(launch_agent_path), meta
+
+    if target_platform == "Windows":
+        paths = setup_windows_proxy_files(
+            node, runtime, helper, transparent_url, upstream_url, runtime.parent, startup_dir
+        )
+        meta = {
+            "platform": "windows",
+            "windows_runner_cmd": str(paths["cmd"]),
+            "windows_runner_vbs": str(paths["vbs"]),
+            "windows_startup": str(paths["startup"]) if paths["startup"] else "",
+        }
+        if skip_live_start:
+            return None, meta
+        if is_windows():
+            return start_windows_proxy(paths["vbs"]), meta
+        return None, meta
+
+    meta = {"platform": "other"}
+    if skip_live_start:
+        return None, meta
+    return start_detached_proxy(node, runtime, helper, transparent_url, upstream_url), meta
 
 
 def start_launch_agent(path: Path) -> str | None:
@@ -993,6 +1124,16 @@ def cmd_configure_desktop(args: argparse.Namespace) -> None:
     if args.default_model and args.default_model not in catalog_ids:
         emit({"status": "blocked", "error": "default model is absent from the proxy catalog"}, 2)
 
+    target_platform = (
+        "Windows"
+        if getattr(args, "platform", "auto") in {"windows", "win"}
+        else (
+            "Darwin"
+            if getattr(args, "platform", "auto") in {"darwin", "mac"}
+            else ("Windows" if is_windows() else platform.system())
+        )
+    )
+
     current = config_path.read_text(encoding="utf-8")
     current_sha = hashlib.sha256(current.encode()).hexdigest()
     if args.expected_sha256 and current_sha != args.expected_sha256:
@@ -1014,6 +1155,7 @@ def cmd_configure_desktop(args: argparse.Namespace) -> None:
     result = {
         "status": "planned" if not args.apply else "unchanged",
         "finding_id": "models.desktop_transparent_proxy_missing",
+        "platform": "windows" if target_platform == "Windows" else "darwin",
         "config": str(config_path),
         "config_sha256": current_sha,
         "diff": diff,
@@ -1025,26 +1167,44 @@ def cmd_configure_desktop(args: argparse.Namespace) -> None:
         "transparent_url": args.transparent_url,
         "authenticated_upstream": args.proxy_url,
         "runtime_script": str(runtime_path),
-        "launch_agent": str(launch_agent_path),
+        "launch_agent": str(launch_agent_path) if target_platform != "Windows" else None,
         "backup": None,
         "secrets_redacted": True,
     }
+    if target_platform == "Windows":
+        cmd_path = runtime_path.parent / "run-router.cmd"
+        vbs_path = runtime_path.parent / "run-router-hidden.vbs"
+        s_dir = (
+            Path(args.startup_dir).expanduser()
+            if getattr(args, "startup_dir", None)
+            else default_windows_startup_dir()
+        )
+        result["windows_runner_cmd"] = str(cmd_path)
+        result["windows_runner_vbs"] = str(vbs_path)
+        result["windows_startup"] = str(s_dir / "codex-model-router.vbs")
     if not args.apply:
         emit(result)
 
     runtime_source = (SKILL_DIR / "scripts" / "codex-model-router.mjs").read_text(encoding="utf-8")
     runtime_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     atomic_write(runtime_path, runtime_source, 0o700)
-    launch_error = start_transparent_proxy(
+    launch_error, proxy_meta = start_transparent_proxy(
         node_path,
         runtime_path,
         helper_path,
         args.transparent_url,
         args.proxy_url,
         launch_agent_path,
+        target_platform=target_platform,
+        startup_dir=Path(args.startup_dir).expanduser() if getattr(args, "startup_dir", None) else None,
+        skip_live_start=getattr(args, "skip_live_check", False),
     )
-    if launch_error or not wait_for_transparent_proxy(args.transparent_url):
-        emit({"status": "blocked", "error": launch_error or "transparent proxy health check failed"}, 2)
+    result.update(proxy_meta)
+    if not getattr(args, "skip_live_check", False):
+        if launch_error or not wait_for_transparent_proxy(args.transparent_url):
+            emit({"status": "blocked", "error": launch_error or "transparent proxy health check failed"}, 2)
+    else:
+        result["transparent_proxy_healthy"] = "skipped"
 
     if updated != current:
         result["backup"] = str(backup(config_path))
@@ -1062,7 +1222,8 @@ def cmd_configure_desktop(args: argparse.Namespace) -> None:
     if after_error or inventory_after != inventory_before:
         emit({"status": "blocked", "error": "thread inventory changed during desktop configuration"}, 2)
     result["thread_inventory_after"] = inventory_after
-    result["transparent_proxy_healthy"] = True
+    if not getattr(args, "skip_live_check", False):
+        result["transparent_proxy_healthy"] = True
     emit(result)
 
 
@@ -1070,6 +1231,15 @@ def cmd_audit(args: argparse.Namespace) -> None:
     config_path = Path(args.config).expanduser()
     profile_path = Path(args.profile_config).expanduser()
     state_db = Path(args.state_db).expanduser()
+    target_platform = (
+        "Windows"
+        if getattr(args, "platform", "auto") in {"windows", "win"}
+        else (
+            "Darwin"
+            if getattr(args, "platform", "auto") in {"darwin", "mac"}
+            else ("Windows" if is_windows() else platform.system())
+        )
+    )
     config, config_error = load_config(config_path)
     profile, profile_error = load_config(profile_path)
     default_provider = config.get("model_provider", "openai")
@@ -1866,6 +2036,7 @@ def parser() -> argparse.ArgumentParser:
     audit.add_argument("--models-file")
     audit.add_argument("--codex", default="codex")
     audit.add_argument("--proxy-binary", default=str(DEFAULT_PROXY_BINARY))
+    audit.add_argument("--platform", choices=["auto", "darwin", "windows", "mac", "win"], default="auto")
     audit.set_defaults(func=cmd_audit)
 
     configure = sub.add_parser("configure")
@@ -1893,6 +2064,9 @@ def parser() -> argparse.ArgumentParser:
     desktop.add_argument("--default-model", default="gpt-5.6-sol")
     desktop.add_argument("--expected-sha256")
     desktop.add_argument("--apply", action="store_true")
+    desktop.add_argument("--platform", choices=["auto", "darwin", "windows", "mac", "win"], default="auto")
+    desktop.add_argument("--skip-live-check", action="store_true", help="Tests only; never use for live repair")
+    desktop.add_argument("--startup-dir", help="Custom Windows Startup directory (for testing or custom path)")
     desktop.set_defaults(func=cmd_configure_desktop)
 
     multi_agent = sub.add_parser("configure-multi-agent")

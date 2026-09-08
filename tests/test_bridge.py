@@ -531,7 +531,7 @@ class BridgeTests(unittest.TestCase):
             slugs = {item["slug"] for item in json.loads(target.read_text())["models"]}
             self.assertEqual(
                 slugs,
-                {"gpt-5.6-sol", "grok-4.6", "deepseek-v4-pro", "deepseek-v4-flash"},
+                {"gpt-5.6-sol", "grok-4.6", "deepseek-v4-pro", "deepseek-v4-flash", "gemini-3.7-flash-high", "gemini-3.8-flash-high"},
             )
             again = run_bridge(*base, "--apply")
             self.assertEqual(again.returncode, 0, again.stderr or again.stdout)
@@ -625,6 +625,141 @@ class BridgeTests(unittest.TestCase):
         command, args = module.helper_invocation(Path("read-client-key.rb"))
         self.assertTrue(Path(command).name.startswith("ruby") or command.endswith("ruby"))
         self.assertEqual(args, ["read-client-key.rb"])
+
+    def test_windows_proxy_files_generation(self) -> None:
+        module_spec = __import__("importlib.util").util.spec_from_file_location("bridge", SCRIPT)
+        module = __import__("importlib.util").util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            node = root / "node.exe"
+            runtime = root / "codex-model-router.mjs"
+            helper = root / "read-client-key.py"
+            state_dir = root / "state"
+            startup_dir = root / "startup"
+
+            node.write_text("dummy", encoding="utf-8")
+            runtime.write_text("dummy", encoding="utf-8")
+            helper.write_text("dummy", encoding="utf-8")
+
+            paths = module.setup_windows_proxy_files(
+                node=node,
+                runtime=runtime,
+                helper=helper,
+                transparent_url="http://127.0.0.1:8318/v1",
+                upstream_url="http://127.0.0.1:8317/v1",
+                state_dir=state_dir,
+                startup_dir=startup_dir,
+            )
+
+            cmd_file = paths["cmd"]
+            vbs_file = paths["vbs"]
+            startup_file = paths["startup"]
+
+            self.assertTrue(cmd_file.exists())
+            self.assertTrue(vbs_file.exists())
+            self.assertTrue(startup_file.exists())
+
+            cmd_text = cmd_file.read_text(encoding="utf-8")
+            self.assertIn("CODEX_BRIDGE_LISTEN_PORT=8318", cmd_text)
+            self.assertIn("CODEX_BRIDGE_CLIPROXY_BASE_URL=http://127.0.0.1:8317", cmd_text)
+            self.assertIn("CODEX_BRIDGE_DISABLE_GPT_WS=true", cmd_text)
+            self.assertIn(str(node), cmd_text)
+            self.assertIn(str(runtime), cmd_text)
+
+            vbs_text = vbs_file.read_text(encoding="utf-8")
+            self.assertIn('WshShell.Run Chr(34) & "' + str(cmd_file) + '" & Chr(34), 0, False', vbs_text)
+
+            startup_text = startup_file.read_text(encoding="utf-8")
+            self.assertIn('WshShell.Run Chr(34) & "' + str(vbs_file) + '" & Chr(34), 0, False', startup_text)
+
+    def test_configure_desktop_windows_planned_and_applied(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config = root / "config.toml"
+            config.write_text('model_provider = "openai"\n', encoding="utf-8")
+            state_db = root / "state_5.sqlite"
+            catalog = root / "catalog.json"
+            catalog.write_text(json.dumps({"models": [native_template()]}), encoding="utf-8")
+            auth = root / "auth.json"
+            auth.write_text(
+                json.dumps({
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "id_token": "fixture",
+                        "access_token": "fixture",
+                        "refresh_token": "fixture",
+                    },
+                }),
+                encoding="utf-8",
+            )
+            helper = root / "read-client-key.py"
+            runtime = root / "state_dir" / "codex-model-router.mjs"
+            node = root / "node.exe"
+            startup_dir = root / "Startup"
+            helper.write_text("fixture", encoding="utf-8")
+            node.write_text("fixture", encoding="utf-8")
+
+            connection = sqlite3.connect(state_db)
+            connection.execute("CREATE TABLE threads (id TEXT, model_provider TEXT, archived INTEGER)")
+            connection.executemany(
+                "INSERT INTO threads VALUES (?, ?, 0)",
+                [("openai-1", "openai"), ("openai-2", "openai"), ("proxy-1", "cli_proxy")],
+            )
+            connection.commit()
+            connection.close()
+
+            base_args = [
+                "configure-desktop",
+                "--platform",
+                "windows",
+                "--config",
+                str(config),
+                "--state-db",
+                str(state_db),
+                "--catalog",
+                str(catalog),
+                "--auth-file",
+                str(auth),
+                "--helper",
+                str(helper),
+                "--runtime-script",
+                str(runtime),
+                "--node",
+                str(node),
+                "--startup-dir",
+                str(startup_dir),
+            ]
+            plan_proc = run_bridge(*base_args)
+            self.assertEqual(plan_proc.returncode, 0, plan_proc.stderr or plan_proc.stdout)
+            plan_payload = json.loads(plan_proc.stdout)
+            self.assertEqual(plan_payload["status"], "planned")
+            self.assertEqual(plan_payload["platform"], "windows")
+            self.assertIsNone(plan_payload["launch_agent"])
+            self.assertIn("windows_runner_cmd", plan_payload)
+            self.assertIn("windows_runner_vbs", plan_payload)
+            self.assertIn("windows_startup", plan_payload)
+
+            apply_proc = run_bridge(*base_args, "--skip-live-check", "--apply")
+            self.assertEqual(apply_proc.returncode, 0, apply_proc.stderr or apply_proc.stdout)
+            apply_payload = json.loads(apply_proc.stdout)
+            self.assertEqual(apply_payload["status"], "applied")
+            self.assertEqual(apply_payload["platform"], "windows")
+
+            cmd_path = Path(apply_payload["windows_runner_cmd"])
+            vbs_path = Path(apply_payload["windows_runner_vbs"])
+            startup_path = Path(apply_payload["windows_startup"])
+
+            self.assertTrue(cmd_path.exists())
+            self.assertTrue(vbs_path.exists())
+            self.assertTrue(startup_path.exists())
+            self.assertTrue(runtime.exists())
+
+            cfg_text = config.read_text(encoding="utf-8")
+            self.assertIn('model_provider = "openai"', cfg_text)
+            self.assertIn('openai_base_url = "http://127.0.0.1:8318/v1"', cfg_text)
+            self.assertIn('model_catalog_json = "' + str(catalog) + '"', cfg_text)
 
 
 if __name__ == "__main__":
