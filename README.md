@@ -7,7 +7,7 @@
 ## 中文说明
 
 <p align="center">
-  <img src="image/README/1788848198456.png" alt="Codex 自愈多模型桥 宣传海报" width="800">
+  <img src="https://raw.githubusercontent.com/Walking-SCR/codex-autoheal-bridge/refs/heads/main/image/README/1788848198456.png" alt="Codex 自愈多模型桥 宣传海报" width="800">
 </p>
 
 ### 📖 项目简介
@@ -19,7 +19,7 @@
 同时内置了**断网/休眠按需自愈引擎**，即便电脑合盖休眠数天，唤醒后点击发送依然能自动完成后台换票，彻底告别高频出现的 `503 auth_unavailable` 报错。
 
 <p align="center">
-  <img src="assets/model-picker-demo.png" alt="Codex / GPT App 下拉菜单模型自由切换实机效果" width="850">
+  <img src="https://raw.githubusercontent.com/Walking-SCR/codex-autoheal-bridge/refs/heads/main/assets/model-picker-demo.png" alt="Codex / GPT App 下拉菜单模型自由切换实机效果" width="850">
 </p>
 
 ---
@@ -270,7 +270,7 @@ model_catalog_json = "~/.codex/model-catalog-cli-proxy.json"
 ## English
 
 <p align="center">
-  <img src="image/README/1788848240075.png" alt="Codex Autoheal Bridge Poster Cover" width="800">
+  <img src="https://raw.githubusercontent.com/Walking-SCR/codex-autoheal-bridge/refs/heads/main/image/README/1788848240075.png" alt="Codex Autoheal Bridge Poster Cover" width="800">
 </p>
 
 ### 📖 Overview
@@ -282,7 +282,7 @@ It overcomes the limitation of Codex Desktop being locked into a single model pr
 It features an **on-demand OAuth self-healing engine**: even if your computer stays asleep or powered off for days, the gateway automatically and silently refreshes expired tokens within 300ms upon waking, eliminating the notorious `503 auth_unavailable` error.
 
 <p align="center">
-  <img src="assets/model-picker-demo.png" alt="Codex / GPT App Model Dropdown in Action" width="850">
+  <img src="https://raw.githubusercontent.com/Walking-SCR/codex-autoheal-bridge/refs/heads/main/assets/model-picker-demo.png" alt="Codex / GPT App Model Dropdown in Action" width="850">
 </p>
 
 ---
