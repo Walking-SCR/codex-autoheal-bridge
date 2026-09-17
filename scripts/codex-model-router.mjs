@@ -490,30 +490,59 @@ function scrubForeignEncryptedContent(value, targetProvider) {
   return result;
 }
 
+const BLOCKED_CODEX_IDENTITY = "You are Codex, an agent based on GPT-5.";
+const SAFE_CODEX_IDENTITY = "You are a helpful AI coding assistant.";
+
+function rewriteBlockedCodexIdentity(value) {
+  let replacements = 0;
+  const visit = (item) => {
+    if (typeof item === "string") {
+      const count = item.split(BLOCKED_CODEX_IDENTITY).length - 1;
+      if (count === 0) return item;
+      replacements += count;
+      return item.replaceAll(BLOCKED_CODEX_IDENTITY, SAFE_CODEX_IDENTITY);
+    }
+    if (Array.isArray(item)) return item.map(visit);
+    if (!item || typeof item !== "object") return item;
+    return Object.fromEntries(Object.entries(item).map(([key, nested]) => [key, visit(nested)]));
+  };
+  return { value: visit(value), replacements };
+}
+
 export function sanitizeBodyForRoute(bodyBuffer, requestHeaders, route) {
   const contentType = String(requestHeaders["content-type"] || "");
   if (!bodyBuffer?.length || !contentType.includes("application/json")) {
-    return { buffer: bodyBuffer, changed: false };
+    return { buffer: bodyBuffer, changed: false, promptRewriteCount: 0 };
   }
   const encoding = String(requestHeaders["content-encoding"] || "").toLowerCase();
   let decoded = bodyBuffer;
   try {
     if (encoding === "zstd") decoded = zstdDecompressSync(bodyBuffer);
     const payload = JSON.parse(decoded.toString("utf8"));
-    if (!containsForeignEncryptedContent(payload, route.provider)) {
-      return { buffer: bodyBuffer, changed: false };
+    let sanitized = payload;
+    let changed = false;
+    let promptRewriteCount = 0;
+    if (containsForeignEncryptedContent(sanitized, route.provider)) {
+      sanitized = scrubForeignEncryptedContent(sanitized, route.provider);
+      if (sanitized && typeof sanitized === "object" && !Array.isArray(sanitized)) {
+        delete sanitized.previous_response_id;
+      }
+      changed = true;
     }
-    const sanitized = scrubForeignEncryptedContent(payload, route.provider);
-    if (sanitized && typeof sanitized === "object" && !Array.isArray(sanitized)) {
-      delete sanitized.previous_response_id;
+    if (route.provider === "gemini" || route.provider === "claude") {
+      const rewritten = rewriteBlockedCodexIdentity(sanitized);
+      sanitized = rewritten.value;
+      promptRewriteCount = rewritten.replacements;
+      changed ||= promptRewriteCount > 0;
     }
+    if (!changed) return { buffer: bodyBuffer, changed: false, promptRewriteCount: 0 };
     let output = Buffer.from(JSON.stringify(sanitized));
     if (encoding === "zstd") output = zstdCompressSync(output);
-    return { buffer: output, changed: true };
+    return { buffer: output, changed: true, promptRewriteCount };
   } catch {
     // Never guess or corrupt an opaque request.  The route remains explicit;
     // Codex/upstream will return the original protocol error if it is opaque.
-    return { buffer: bodyBuffer, changed: false };
+    return { buffer: bodyBuffer, changed: false, promptRewriteCount: 0 };
   }
 }
 
@@ -683,6 +712,9 @@ export function createRouterServer(options = {}) {
     }
 
     const prepared = sanitizeBodyForRoute(body, request.headers, route);
+    if (prepared.promptRewriteCount > 0) {
+      log(`${formatRouterLog(context, "antigravity_prompt_rewrite")} replacements=${prepared.promptRewriteCount}`);
+    }
     if (prepared.changed) {
       headers["content-length"] = String(prepared.buffer.length);
     }
@@ -719,6 +751,11 @@ export function createRouterServer(options = {}) {
     }
     if (route.upstream === "gptNative" && config.disableGptWebSockets) {
       log(formatRouterLog(context, "gpt_ws_disabled"));
+      socket.end("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    if (route.provider === "gemini" || route.provider === "claude") {
+      log(formatRouterLog(context, "antigravity_ws_disabled_for_prompt_rewrite"));
       socket.end("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n");
       return;
     }

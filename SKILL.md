@@ -34,6 +34,14 @@ Codex Desktop
 3. **Legacy Transparent Proxy Deprecation**:
    The legacy `transparent_proxy.mjs` (which blindly forwarded all models to 8317) and its LaunchAgent `com.zhijian.codex-cli-model-bridge-transparent-proxy` are permanently superseded by `codex-model-router.mjs` and `com.zhijian.codex-cli-model-bridge-router`.
 
+### Antigravity prompt-fingerprint compatibility
+
+The Antigravity Gemini and Claude routes can return `429 RESOURCE_EXHAUSTED` when the request contains the exact Codex identity sentence `You are Codex, an agent based on GPT-5.`. The 8318 router rewrites that exact string to `You are a helpful AI coding assistant.` only when `route.provider` is `gemini` or `claude`; OpenAI, GLM, MiniMax, and other non-Antigravity routes are byte-for-byte unaffected.
+
+Because the router cannot inspect prompt data inside a WebSocket tunnel, Gemini and Claude WebSocket upgrades are rejected with `426 Upgrade Required` so Codex falls back to the HTTP Responses path where the rewrite is applied. Keep the managed Antigravity catalog entries on `prefer_websockets = false` as the compatibility baseline. The router logs `antigravity_prompt_rewrite` without logging prompt contents.
+
+This rewrite addresses the prompt-fingerprint 429 class only. An upstream `503 UNAVAILABLE` / `No capacity available for model ...` response is a separate Antigravity capacity condition and must be retried after the upstream cooldown; it is not fixed by changing local credentials or enabling Multi-Agent v2 compatibility.
+
 When the user wants GLM-5.3 from a Coding Plan key, read [glm-coding-plan.md](references/glm-coding-plan.md). If Desktop already uses Codex Router on port 4202, add `zai-coding` there and keep the OpenAI Provider identity. Do not run `npx @z_ai/coding-helper`.
 
 On Windows, start with the isolated profile. Read [windows.md](references/windows.md). Do not require Homebrew, LaunchAgents, or Codex Router.

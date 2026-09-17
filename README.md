@@ -32,8 +32,9 @@
 4. **休眠/关机无感自愈（告别 503）**针对 Google OAuth 访问令牌（Access Token）仅 1 小时寿命的问题，8318 路由在请求进入时自动读取本地 6 个月有效的 Refresh Token，300 毫秒内静默向 Google 换取新票并同步，休眠醒来即用。
 5. **刚唤醒网络重连容错**针对笔记本电脑开盖瞬间 Wi-Fi 正在重连的情况，内置 3 次网络自动重试机制，防止刚开机发消息由于断网而报错。
 6. **跨模型上下文无缝切换**自动清洗跨 Provider 的加密思维链（Encrypted Reasoning）及 Response ID，避免在同一个会话中从 Gemini 切到 GPT 或 DeepSeek 时因内部格式不兼容而崩溃。
-7. **非标 SSE 流结束符自动补齐（SSE Normalizer）**针对 MiniMax 等国产厂商在流式结束时不发送 `data: [DONE]` 导致 8317 误判断流报 503 的非标问题，8318 路由透明内置了流终结符补齐垫片，自动兼容所有非标中转站。
-8. **开箱即用与纯本地安全**
+7. **Antigravity Gemini / Claude 提示词指纹兼容**针对上游对 `You are Codex, an agent based on GPT-5.` 返回 429 的情况，8318 仅对 Antigravity 的 Gemini 和 Claude 路由改写为 `You are a helpful AI coding assistant.`；GPT、GLM、MiniMax 等其他路由不改写。为保证请求体可见，Antigravity WebSocket 会回落到 HTTP Responses。
+8. **非标 SSE 流结束符自动补齐（SSE Normalizer）**针对 MiniMax 等国产厂商在流式结束时不发送 `data: [DONE]` 导致 8317 误判断流报 503 的非标问题，8318 路由透明内置了流终结符补齐垫片，自动兼容所有非标中转站。
+9. **开箱即用与纯本地安全**
    所有凭据与分流均在本地 `127.0.0.1` 环回接口运行，密钥和 OAuth 凭证不出本机。
 
 ---
@@ -252,6 +253,8 @@ model_catalog_json = "~/.codex/model-catalog-cli-proxy.json"
 | `503 upstream stream closed before [DONE]` | 厂商流式结束未发`[DONE]` 终结符（如 MiniMax）            | 8318 已内置`__sse_shim` 垫片透明补齐，通过 `add-model` 即可自动识别并挂载 |
 | `missing field support_verbosity`          | 手动修改模型目录时遗漏了 Rust 强类型必填字段               | 使用`bridge.py add-model` 自动深拷贝生成，杜绝手动修改 JSON 出错            |
 | `503 MODEL_CAPACITY_EXHAUSTED`             | Google Antigravity 服务端模型配额暂时满载（多见于 Claude） | 属于云端服务器暂时排队，本地配置完好，换用 Gemini 即可                        |
+| `429 RESOURCE_EXHAUSTED`（仅完整 Codex 提示词触发） | Antigravity 上游匹配到固定 Codex 身份提示词指纹 | 8318 仅对 Gemini / Claude 改写该句，并将 WebSocket 回落到 HTTP；等待 `Retry-After` 冷却后重试 |
+| `503 No capacity available for model ...`  | Antigravity 上游暂时没有该模型的服务容量 | 等待上游冷却后重试；这不是本地 OAuth 或改写规则故障 |
 | `502 ECONNREFUSED`                         | 8317 或 8318 本地端口未启动                                | 检查 LaunchAgent 运行状态或日志                                               |
 
 ---
@@ -292,8 +295,9 @@ It features an **on-demand OAuth self-healing engine**: even if your computer st
 4. **On-Demand Sleep/Wake Auto-Renewal**While Google OAuth access tokens expire in 1 hour, the 8318 Router silently exchanges the 6-month persistent refresh token for a new access token within 300ms before dispatching requests.
 5. **Wi-Fi Reconnection Retries**Includes 3-attempt exponential network retry handling for moments right after laptop lid opening when Wi-Fi is still reconnecting.
 6. **Encrypted Reasoning Scrubbing**Automatically scrubs cross-provider encrypted reasoning blobs and response IDs when switching models inside the same thread, preventing schema incompatibilities.
-7. **Non-Standard SSE Stream Normalizer (`__sse_shim`)**Automatically detects and normalizes non-compliant upstream providers (such as MiniMax) that close SSE streams without `data: [DONE]`, seamlessly preventing gateway 503 interruptions.
-8. **100% Local & Private**
+7. **Antigravity Gemini / Claude Prompt-Fingerprint Compatibility**When Antigravity returns `429 RESOURCE_EXHAUSTED` for the exact Codex identity sentence `You are Codex, an agent based on GPT-5.`, the 8318 Router rewrites it to `You are a helpful AI coding assistant.` only for Gemini and Claude. GPT, GLM, MiniMax, and other routes remain unchanged. Antigravity WebSocket upgrades fall back to HTTP Responses so the body can be rewritten.
+8. **Non-Standard SSE Stream Normalizer (`__sse_shim`)**Automatically detects and normalizes non-compliant upstream providers (such as MiniMax) that close SSE streams without `data: [DONE]`, seamlessly preventing gateway 503 interruptions.
+9. **100% Local & Private**
    All traffic routing and credential storage reside on `127.0.0.1`.
 
 ---
@@ -389,6 +393,14 @@ python3 ~/.codex/skills/codex-autoheal-bridge/scripts/bridge.py add-model \
   --display-name "<dropdown_label>" \
   --apply
 ```
+
+### 🛠️ Antigravity Troubleshooting
+
+| Symptom | Meaning | Action |
+| :--- | :--- | :--- |
+| `429 RESOURCE_EXHAUSTED` only with the full Codex prompt | Antigravity matched the fixed Codex identity prompt fingerprint | The Router rewrites the sentence only for Gemini / Claude and forces their WebSocket attempts to HTTP; check for `antigravity_prompt_rewrite` in the router log |
+| `503 No capacity available for model ...` | The upstream model has no serving capacity temporarily | Wait for the provider cooldown and retry; do not rotate local OAuth credentials |
+| `422 ModelInput` during Subagent/Multi-Agent work | The third-party endpoint does not understand Codex's private `agent_message` input | Enable CLIProxyAPI's `codex.optimize-multi-agent-v2` compatibility transform and run the dedicated probe |
 
 ---
 
