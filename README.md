@@ -263,6 +263,10 @@ model_catalog_json = "~/.codex/model-catalog-cli-proxy.json"
 
 本项目遵循 [MIT License](LICENSE)。本项目基于 [Luis Pater / Router-For.ME](https://github.com/router-for-me/CLIProxyAPI) 以及 [Zhijian AI](https://github.com/zjp1997720) 的开源研究与基础架构进行重构与增强，特别感谢开源社区对本地模型桥接领域的贡献。
 
+### 📝 修复备注
+
+本次 README 图片显示修复没有移动图片文件，图片仍保留在 `image/README/` 与 `assets/` 目录中。问题来自 GitHub README 渲染时对相对 `src` 路径的解析不稳定，因此统一改为带 `refs/heads/main` 的绝对 raw URL。若以后切换默认分支，需要同步更新这些 URL 中的分支名；图片内容本身无需重复上传。
+
 > **免责声明**：OpenAI, GPT, Google, Gemini, Anthropic, Claude, DeepSeek 等名称与商标归其各自版权方所有。本项目仅用于个人学习研究与本地开发效率提升。
 
 ---
@@ -407,5 +411,9 @@ python3 ~/.codex/skills/codex-autoheal-bridge/scripts/bridge.py add-model \
 ### 📄 License & Attribution
 
 Distributed under the [MIT License](LICENSE).Built upon initial foundations by [Luis Pater / Router-For.ME](https://github.com/router-for-me/CLIProxyAPI) and [Zhijian AI](https://github.com/zjp1997720).
+
+### 📝 Maintenance Note
+
+The README image fix keeps the PNG files in `image/README/` and `assets/`. Only the relative `src` values were replaced with absolute raw GitHub URLs containing `refs/heads/main`, avoiding README rendering and path-resolution issues. If the default branch changes, update the branch segment in those URLs; the image binaries do not need to be uploaded again.
 
 > **Disclaimer**: All product names, logos, and brands (OpenAI, GPT, Google, Gemini, Anthropic, Claude, DeepSeek) are property of their respective owners.
