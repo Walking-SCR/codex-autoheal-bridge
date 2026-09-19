@@ -2021,6 +2021,146 @@ def cmd_list_models(args: argparse.Namespace) -> None:
     emit({"status": "ok", "total": len(output), "models": output})
 
 
+def _message_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        value = item.get("text")
+        if isinstance(value, str) and value:
+            parts.append(value)
+    return "\n".join(parts).strip()
+
+
+def build_handoff_markdown(
+    session_path: Path,
+    target_model: str,
+    max_messages: int = 12,
+    max_chars_per_message: int = 4_000,
+) -> dict[str, object]:
+    """Build a provider-neutral handoff from visible rollout messages only."""
+    visible: list[dict[str, str]] = []
+    errors: list[str] = []
+    thread_id = None
+    source_model = None
+    with session_path.open("r", encoding="utf-8", errors="replace") as handle:
+        for raw in handle:
+            try:
+                record = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            payload = record.get("payload", {}) if isinstance(record, dict) else {}
+            if not isinstance(payload, dict):
+                continue
+            if record.get("type") == "response_item" and payload.get("type") == "message":
+                role = payload.get("role")
+                if role not in {"user", "assistant"}:
+                    continue
+                text = _message_text(payload.get("content"))
+                if not text:
+                    continue
+                visible.append({"role": role, "text": text[:max_chars_per_message]})
+                metadata = payload.get("internal_chat_message_metadata_passthrough")
+                if isinstance(metadata, dict):
+                    client_metadata = metadata.get("client_metadata")
+                    if isinstance(client_metadata, dict):
+                        thread_id = thread_id or client_metadata.get("thread_id")
+            if payload.get("type") == "task_complete" and payload.get("error"):
+                error = payload.get("error")
+                message = error.get("message") if isinstance(error, dict) else str(error)
+                if message:
+                    errors.append(str(message)[:max_chars_per_message])
+            if record.get("type") == "turn_context":
+                model = payload.get("model")
+                if isinstance(model, str):
+                    source_model = source_model or model
+
+    selected = visible[-max_messages:]
+    lines = [
+        "# Provider Handoff",
+        "",
+        "This is a plain-text handoff between model providers. The previous provider's private reasoning and compaction capsule are intentionally excluded.",
+        "",
+        f"- Source session: `{thread_id or session_path.stem}`",
+        f"- Source model: `{source_model or 'unknown'}`",
+        f"- Target model: `{target_model}`",
+        "",
+        "## Visible conversation context",
+        "",
+    ]
+    if not selected:
+        lines.append("No visible user/assistant messages were found. Ask the user to restate the task.")
+    else:
+        for item in selected:
+            lines.extend([f"### {item['role']}", "", item["text"], ""])
+    if errors:
+        lines.extend(["## Previous errors", ""])
+        for error in errors[-5:]:
+            lines.append(f"- {error}")
+        lines.append("")
+    lines.extend([
+        "## Handoff instructions",
+        "",
+        "Continue the task using the visible context above. Re-check files and current service state before making changes. If earlier details are missing, ask for them instead of assuming hidden context.",
+        "",
+    ])
+    return {
+        "status": "ok",
+        "source_session": str(session_path),
+        "thread_id": thread_id,
+        "source_model": source_model,
+        "target_model": target_model,
+        "message_count": len(selected),
+        "handoff_markdown": "\n".join(lines),
+    }
+
+
+def _find_session_by_thread(thread_id: str) -> Path | None:
+    sessions_root = DEFAULT_CODEX_HOME / "sessions"
+    if not sessions_root.exists():
+        return None
+    candidates = sorted(sessions_root.rglob("*.jsonl"), key=lambda item: item.stat().st_mtime, reverse=True)
+    for exact in [path for path in candidates if thread_id in path.name]:
+        return exact
+    for path in candidates:
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                first = handle.readline()
+                record = json.loads(first) if first else {}
+                payload = record.get("payload", {}) if isinstance(record, dict) else {}
+                if isinstance(payload, dict) and thread_id in {payload.get("session_id"), payload.get("id")}:
+                    return path
+        except OSError:
+            continue
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def cmd_handoff(args: argparse.Namespace) -> None:
+    session_path = Path(args.session).expanduser() if args.session else _find_session_by_thread(args.thread_id)
+    if not session_path or not session_path.exists():
+        emit({"status": "blocked", "error": "Codex session rollout not found; pass --session explicitly"}, 2)
+        return
+    result = build_handoff_markdown(
+        session_path,
+        args.target_model,
+        max_messages=args.max_messages,
+        max_chars_per_message=args.max_chars_per_message,
+    )
+    if args.output:
+        output = Path(args.output).expanduser()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(str(result["handoff_markdown"]), encoding="utf-8")
+        result["output"] = str(output)
+        result.pop("handoff_markdown", None)
+    emit(result)
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Codex CLI model bridge")
     sub = root.add_subparsers(dest="command", required=True)
@@ -2146,6 +2286,15 @@ def parser() -> argparse.ArgumentParser:
     list_m = sub.add_parser("list-models")
     list_m.add_argument("--catalog", default=str(DEFAULT_CODEX_HOME / "model-catalog-cli-proxy.bridge-test.json"))
     list_m.set_defaults(func=cmd_list_models)
+
+    handoff = sub.add_parser("handoff", help="Generate a provider-neutral handoff from a Codex rollout")
+    handoff.add_argument("--target-model", required=True)
+    handoff.add_argument("--session", help="Path to a Codex rollout JSONL")
+    handoff.add_argument("--thread-id", help="Find the newest rollout containing this thread ID")
+    handoff.add_argument("--max-messages", type=int, default=12)
+    handoff.add_argument("--max-chars-per-message", type=int, default=4_000)
+    handoff.add_argument("--output", help="Write Markdown to this path")
+    handoff.set_defaults(func=cmd_handoff)
 
     return root
 

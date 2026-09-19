@@ -14,7 +14,7 @@
 
 **codex自定义模型桥接 skill**（Codex Autoheal Bridge）是专为 **Codex Desktop** 和 **Codex CLI** 打造的智能多模型共存网关。
 
-它打破了 Codex Desktop 只能绑定单一大模型 Provider 的限制，**支持一键将任何自定义模型添加至 Codex / GPT App 原生的模型选择列表中**。用户无需切换账号或新建会话，即可在**同一个对话窗口中自由无缝切换官方原生 GPT 与任意自定义添加的模型**（例如上一句用 GPT-5.6 构思架构，下一句切 DeepSeek 敲具体代码，再下一句切 Gemini 3.8 分析超长文档）。
+它打破了 Codex Desktop 只能绑定单一大模型 Provider 的限制，**支持一键将任何自定义模型添加至 Codex / GPT App 原生的模型选择列表中**。同 Provider 可以继续复用长对话；跨 Provider 切换时，路由器会识别 provider-specific 的压缩状态，默认阻断不兼容的内部胶囊并提示新建目标模型对话，避免把错误状态发送到上游。
 
 同时内置了**断网/休眠按需自愈引擎**，即便电脑合盖休眠数天，唤醒后点击发送依然能自动完成后台换票，彻底告别高频出现的 `503 auth_unavailable` 报错。
 
@@ -26,12 +26,12 @@
 
 ### 🌟 核心特性
 
-1. **原生模型下拉列表集成 & 会话内自由切换**直接无缝打通 Codex / GPT App 客户端的原生模型选择器。用户自定义添加的模型与官方 GPT 并列展示，支持在同一个会话内随时随心切换，共享可见上下文且互不干扰。
+1. **原生模型下拉列表集成 & Provider 感知切换**直接打通 Codex / GPT App 客户端的原生模型选择器。用户自定义添加的模型与官方 GPT 并列展示；同 Provider 可继续复用长对话，跨 Provider 遇到压缩状态时由路由器提前拦截并提示新建目标模型对话，避免把不兼容的内部状态发送到上游。
 2. **一键添加新模型（自然语言 / CLI 命令防呆）**支持一键将任意带 API Key 的模型挂载到 Codex / GPT App 模型列表中。内置“双模真机连通性探针”与“37 字段 Rust 强类型深拷贝”，彻底避免手工修改 JSON 遗漏 `support_verbosity` 等必填字段引起的解析崩溃。
 3. **双轨模型隔离（官方 GPT 绝不暴雷）**采用 8318 智能路由机制，`gpt-*` 和 `codex-*` 请求直接走官方通道，第三方模型（Gemini / Claude / DeepSeek）转发到 8317 本地代理。第三方服务或账号故障绝不影响官方 GPT 的正常使用。
 4. **休眠/关机无感自愈（告别 503）**针对 Google OAuth 访问令牌（Access Token）仅 1 小时寿命的问题，8318 路由在请求进入时自动读取本地 6 个月有效的 Refresh Token，300 毫秒内静默向 Google 换取新票并同步，休眠醒来即用。
 5. **刚唤醒网络重连容错**针对笔记本电脑开盖瞬间 Wi-Fi 正在重连的情况，内置 3 次网络自动重试机制，防止刚开机发消息由于断网而报错。
-6. **跨模型上下文无缝切换**自动清洗跨 Provider 的加密思维链（Encrypted Reasoning）及 Response ID，避免在同一个会话中从 Gemini 切到 GPT 或 DeepSeek 时因内部格式不兼容而崩溃。
+6. **跨模型上下文安全边界**自动清洗跨 Provider 的加密思维链（Encrypted Reasoning）及 Response ID；检测到 provider-specific `type=compaction` 时，默认阻断并标记 `handoff_required`，可用 `bridge.py handoff` 生成纯文本交接包；也可通过 `CODEX_BRIDGE_PROVIDER_SWITCH_COMPACTION_MODE=drop_foreign` 启用实验性降级转发。
 7. **Antigravity Gemini / Claude 提示词指纹兼容**针对上游对 `You are Codex, an agent based on GPT-5.` 返回 429 的情况，8318 仅对 Antigravity 的 Gemini 和 Claude 路由改写为 `You are a helpful AI coding assistant.`；GPT、GLM、MiniMax 等其他路由不改写。为保证请求体可见，Antigravity WebSocket 会回落到 HTTP Responses。
 8. **非标 SSE 流结束符自动补齐（SSE Normalizer）**针对 MiniMax 等国产厂商在流式结束时不发送 `data: [DONE]` 导致 8317 误判断流报 503 的非标问题，8318 路由透明内置了流终结符补齐垫片，自动兼容所有非标中转站。
 9. **开箱即用与纯本地安全**
@@ -281,7 +281,7 @@ model_catalog_json = "~/.codex/model-catalog-cli-proxy.json"
 
 **Codex Autoheal Bridge** is an intelligent, self-healing multi-model gateway designed specifically for **Codex Desktop** and **Codex CLI**.
 
-It overcomes the limitation of Codex Desktop being locked into a single model provider, enabling users to **one-click add any custom model directly into the native model picker dropdown of Codex / GPT App**. Users can **freely switch between official native GPT models and any custom added models within the very same ongoing conversation** (e.g. brainstorming with GPT-5.6, writing implementation with DeepSeek, and analyzing long contexts with Gemini 3.8).
+It overcomes the limitation of Codex Desktop being locked into a single model provider, enabling users to **one-click add any custom model directly into the native model picker dropdown of Codex / GPT App**. Same-provider tasks can continue reusing long context; when switching providers, the router detects provider-specific compaction state, blocks incompatible capsules by default, and prompts for a new target-model task with a plain-text summary.
 
 It features an **on-demand OAuth self-healing engine**: even if your computer stays asleep or powered off for days, the gateway automatically and silently refreshes expired tokens within 300ms upon waking, eliminating the notorious `503 auth_unavailable` error.
 
@@ -293,12 +293,12 @@ It features an **on-demand OAuth self-healing engine**: even if your computer st
 
 ### 🌟 Key Highlights
 
-1. **Native Model Dropdown Integration & In-Chat Free Switching**Directly integrates into the Codex / GPT App UI model dropdown. Custom models sit side-by-side with official GPT models, allowing effortless switching at any point in a chat while preserving conversation context.
+1. **Native Model Dropdown Integration & Provider-Aware Switching**Directly integrates into the Codex / GPT App UI model dropdown. Custom models sit side-by-side with official GPT models; same-provider context can continue, while incompatible cross-provider compaction state is blocked before it reaches the upstream.
 2. **One-Click Model Addition (Natural Language / CLI)**Add any external API Key model to the Codex / GPT App list in seconds. Features automated dual-mode preflight live connectivity probe and 37-field Rust serde strict schema deep-copy to completely avoid JSON deserialization errors.
 3. **Dual-Track Isolation (Zero GPT Impact)**The 8318 Router directly routes `gpt-*` and `codex-*` traffic to OpenAI Native endpoints. Third-party models go to the local 8317 CLIProxyAPI. Failures in third-party providers never affect official GPT models.
 4. **On-Demand Sleep/Wake Auto-Renewal**While Google OAuth access tokens expire in 1 hour, the 8318 Router silently exchanges the 6-month persistent refresh token for a new access token within 300ms before dispatching requests.
 5. **Wi-Fi Reconnection Retries**Includes 3-attempt exponential network retry handling for moments right after laptop lid opening when Wi-Fi is still reconnecting.
-6. **Encrypted Reasoning Scrubbing**Automatically scrubs cross-provider encrypted reasoning blobs and response IDs when switching models inside the same thread, preventing schema incompatibilities.
+6. **Provider-Boundary Context Safety**Automatically scrubs cross-provider encrypted reasoning blobs and response IDs. Provider-specific `type=compaction` capsules are blocked by default with `handoff_required`; `bridge.py handoff` generates a plain-text handoff packet, while `CODEX_BRIDGE_PROVIDER_SWITCH_COMPACTION_MODE=drop_foreign` remains an explicit experimental degraded path.
 7. **Antigravity Gemini / Claude Prompt-Fingerprint Compatibility**When Antigravity returns `429 RESOURCE_EXHAUSTED` for the exact Codex identity sentence `You are Codex, an agent based on GPT-5.`, the 8318 Router rewrites it to `You are a helpful AI coding assistant.` only for Gemini and Claude. GPT, GLM, MiniMax, and other routes remain unchanged. Antigravity WebSocket upgrades fall back to HTTP Responses so the body can be rewritten.
 8. **Non-Standard SSE Stream Normalizer (`__sse_shim`)**Automatically detects and normalizes non-compliant upstream providers (such as MiniMax) that close SSE streams without `data: [DONE]`, seamlessly preventing gateway 503 interruptions.
 9. **100% Local & Private**

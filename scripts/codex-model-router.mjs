@@ -73,6 +73,7 @@ const DEFAULTS = Object.freeze({
   requestTimeoutMs: 120_000,
   disableGptWebSockets: true,
   antigravityRefreshLeadMs: 5 * 60 * 1000,
+  providerSwitchCompactionMode: "fail_closed",
 });
 
 function parsePort(value, fallback) {
@@ -91,6 +92,14 @@ function parseDuration(value, fallback) {
   return duration;
 }
 
+function parseCompactionMode(value, fallback = DEFAULTS.providerSwitchCompactionMode) {
+  const mode = String(value ?? fallback).trim().toLowerCase();
+  if (mode !== "fail_closed" && mode !== "drop_foreign") {
+    throw new Error(`Invalid provider switch compaction mode: ${value}`);
+  }
+  return mode;
+}
+
 export function createConfig(env = process.env) {
   return {
     listenHost: env.CODEX_BRIDGE_LISTEN_HOST || DEFAULTS.listenHost,
@@ -105,6 +114,9 @@ export function createConfig(env = process.env) {
     antigravityRefreshLeadMs: parseDuration(
       env.CODEX_BRIDGE_ANTIGRAVITY_REFRESH_LEAD_MS,
       DEFAULTS.antigravityRefreshLeadMs,
+    ),
+    providerSwitchCompactionMode: parseCompactionMode(
+      env.CODEX_BRIDGE_PROVIDER_SWITCH_COMPACTION_MODE,
     ),
   };
 }
@@ -465,7 +477,12 @@ export function upstreamTarget(route, config, requestPath) {
 function isForeignEncryptedContent(value, targetProvider) {
   if (typeof value !== "string" || value.length === 0) return false;
   const isGeminiCarrier = value.startsWith("cpa-gemini-responses-carrier-v1:");
-  return targetProvider === "openai" ? isGeminiCarrier : !isGeminiCarrier;
+  const isAntigravityCompaction = value.startsWith(ANTIGRAVITY_COMPACTION_PREFIX);
+  if (targetProvider === "openai") return isGeminiCarrier || isAntigravityCompaction;
+  if (targetProvider === "gemini" || targetProvider === "claude") {
+    return !isGeminiCarrier && !isAntigravityCompaction;
+  }
+  return !isGeminiCarrier && !isAntigravityCompaction;
 }
 
 function containsForeignEncryptedContent(value, targetProvider) {
@@ -490,6 +507,94 @@ function scrubForeignEncryptedContent(value, targetProvider) {
   return result;
 }
 
+const ANTIGRAVITY_COMPACTION_PREFIX = "cpa-ag-compact-v1:";
+const GEMINI_RESPONSES_CARRIER_PREFIX = "cpa-gemini-responses-carrier-v1:";
+
+export function compactionProviderFamily(routeProvider) {
+  if (routeProvider === "openai") return "openai";
+  if (routeProvider === "gemini" || routeProvider === "claude") return "antigravity";
+  return null;
+}
+
+export function classifyCompactionCapsule(item) {
+  if (!item || typeof item !== "object" || item.type !== "compaction") return null;
+  let encryptedContent;
+  const visit = (value) => {
+    if (typeof encryptedContent === "string") return;
+    if (typeof value === "string") return;
+    if (Array.isArray(value)) {
+      for (const nested of value) visit(nested);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    if (typeof value.encrypted_content === "string") {
+      encryptedContent = value.encrypted_content;
+      return;
+    }
+    for (const nested of Object.values(value)) visit(nested);
+  };
+  visit(item);
+
+  if (!encryptedContent) {
+    return { family: "unknown", format: "missing", prefix: "" };
+  }
+  if (encryptedContent.startsWith(ANTIGRAVITY_COMPACTION_PREFIX)) {
+    return { family: "antigravity", format: "antigravity", prefix: ANTIGRAVITY_COMPACTION_PREFIX };
+  }
+  if (encryptedContent.startsWith(GEMINI_RESPONSES_CARRIER_PREFIX)) {
+    return { family: "gemini", format: "gemini_carrier", prefix: GEMINI_RESPONSES_CARRIER_PREFIX };
+  }
+  if (encryptedContent.startsWith("gAAAA")) {
+    return { family: "openai", format: "openai", prefix: "gAAAA" };
+  }
+  return { family: "unknown", format: "unknown", prefix: encryptedContent.slice(0, 32) };
+}
+
+function findCompactionItems(value, items = []) {
+  if (Array.isArray(value)) {
+    for (const item of value) findCompactionItems(item, items);
+    return items;
+  }
+  if (!value || typeof value !== "object") return items;
+  if (value.type === "compaction") items.push(value);
+  for (const item of Object.values(value)) findCompactionItems(item, items);
+  return items;
+}
+
+function removeIncompatibleCompactionItems(value, targetFamily) {
+  if (value && typeof value === "object" && !Array.isArray(value) && value.type === "compaction") {
+    return classifyCompactionCapsule(value).family === targetFamily ? value : undefined;
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => removeIncompatibleCompactionItems(item, targetFamily))
+      .filter((item) => item !== undefined);
+  }
+  if (!value || typeof value !== "object") return value;
+  const result = {};
+  for (const [key, item] of Object.entries(value)) {
+    const sanitized = removeIncompatibleCompactionItems(item, targetFamily);
+    if (sanitized !== undefined) result[key] = sanitized;
+  }
+  return result;
+}
+
+export function inspectCompactionForRoute(payload, route) {
+  const items = findCompactionItems(payload);
+  const targetFamily = compactionProviderFamily(route?.provider);
+  if (items.length === 0 || !targetFamily) {
+    return { targetFamily, items: [], compatible: true, incompatible: [] };
+  }
+  const classified = items.map((item) => ({ item, capsule: classifyCompactionCapsule(item) }));
+  const incompatible = classified.filter(({ capsule }) => capsule.family !== targetFamily);
+  return {
+    targetFamily,
+    items: classified,
+    compatible: incompatible.length === 0,
+    incompatible,
+  };
+}
+
 const BLOCKED_CODEX_IDENTITY = "You are Codex, an agent based on GPT-5.";
 const SAFE_CODEX_IDENTITY = "You are a helpful AI coding assistant.";
 
@@ -509,10 +614,16 @@ function rewriteBlockedCodexIdentity(value) {
   return { value: visit(value), replacements };
 }
 
-export function sanitizeBodyForRoute(bodyBuffer, requestHeaders, route) {
+export function sanitizeBodyForRoute(bodyBuffer, requestHeaders, route, options = {}) {
   const contentType = String(requestHeaders["content-type"] || "");
   if (!bodyBuffer?.length || !contentType.includes("application/json")) {
-    return { buffer: bodyBuffer, changed: false, promptRewriteCount: 0 };
+    return {
+      buffer: bodyBuffer,
+      changed: false,
+      promptRewriteCount: 0,
+      compactionGuard: null,
+      compactionDropped: 0,
+    };
   }
   const encoding = String(requestHeaders["content-encoding"] || "").toLowerCase();
   let decoded = bodyBuffer;
@@ -522,6 +633,39 @@ export function sanitizeBodyForRoute(bodyBuffer, requestHeaders, route) {
     let sanitized = payload;
     let changed = false;
     let promptRewriteCount = 0;
+    const compactionInspection = inspectCompactionForRoute(sanitized, route);
+    const compactionMode = options.providerSwitchCompactionMode || "fail_closed";
+    let compactionGuard = null;
+    let compactionDropped = 0;
+    if (!compactionInspection.compatible) {
+      const incompatible = compactionInspection.incompatible;
+      if (compactionMode === "drop_foreign") {
+        sanitized = removeIncompatibleCompactionItems(sanitized, compactionInspection.targetFamily);
+        if (sanitized && typeof sanitized === "object" && !Array.isArray(sanitized)) {
+          delete sanitized.previous_response_id;
+        }
+        compactionDropped = incompatible.length;
+        compactionGuard = {
+          action: "dropped",
+          targetFamily: compactionInspection.targetFamily,
+          incompatible: incompatible.map(({ capsule }) => capsule),
+        };
+        changed = true;
+      } else {
+        compactionGuard = {
+          action: "blocked",
+          targetFamily: compactionInspection.targetFamily,
+          incompatible: incompatible.map(({ capsule }) => capsule),
+        };
+        return {
+          buffer: bodyBuffer,
+          changed: false,
+          promptRewriteCount: 0,
+          compactionGuard,
+          compactionDropped: 0,
+        };
+      }
+    }
     if (containsForeignEncryptedContent(sanitized, route.provider)) {
       sanitized = scrubForeignEncryptedContent(sanitized, route.provider);
       if (sanitized && typeof sanitized === "object" && !Array.isArray(sanitized)) {
@@ -535,14 +679,28 @@ export function sanitizeBodyForRoute(bodyBuffer, requestHeaders, route) {
       promptRewriteCount = rewritten.replacements;
       changed ||= promptRewriteCount > 0;
     }
-    if (!changed) return { buffer: bodyBuffer, changed: false, promptRewriteCount: 0 };
+    if (!changed) {
+      return {
+        buffer: bodyBuffer,
+        changed: false,
+        promptRewriteCount: 0,
+        compactionGuard,
+        compactionDropped,
+      };
+    }
     let output = Buffer.from(JSON.stringify(sanitized));
     if (encoding === "zstd") output = zstdCompressSync(output);
-    return { buffer: output, changed: true, promptRewriteCount };
+    return { buffer: output, changed: true, promptRewriteCount, compactionGuard, compactionDropped };
   } catch {
     // Never guess or corrupt an opaque request.  The route remains explicit;
     // Codex/upstream will return the original protocol error if it is opaque.
-    return { buffer: bodyBuffer, changed: false, promptRewriteCount: 0 };
+    return {
+      buffer: bodyBuffer,
+      changed: false,
+      promptRewriteCount: 0,
+      compactionGuard: null,
+      compactionDropped: 0,
+    };
   }
 }
 
@@ -610,6 +768,7 @@ export function createRouterServer(options = {}) {
           gptNative: config.gptNativeBaseUrl,
           cliProxy: config.cliProxyBaseUrl,
         },
+        providerSwitchCompactionMode: config.providerSwitchCompactionMode,
       });
       return;
     }
@@ -711,7 +870,35 @@ export function createRouterServer(options = {}) {
       return;
     }
 
-    const prepared = sanitizeBodyForRoute(body, request.headers, route);
+    const prepared = sanitizeBodyForRoute(body, request.headers, route, {
+      providerSwitchCompactionMode: config.providerSwitchCompactionMode,
+    });
+    if (prepared.compactionGuard?.action === "blocked") {
+      const formats = prepared.compactionGuard.incompatible
+        .map((capsule) => capsule.format)
+        .join(",");
+      log(`${formatRouterLog(context, "provider_switch_compaction_blocked")} target_family=${prepared.compactionGuard.targetFamily} formats=${formats || "unknown"}`);
+      responseJson(response, 409, {
+        error: "provider_switch_compaction_conflict",
+        message: "This conversation contains a compaction state from another model provider. Start a new conversation for the selected model and paste a summary of the previous context.",
+        retryable: false,
+        handoff_required: true,
+        handoff_mode: "new_task_with_plain_text_summary",
+        source_thread_id: context.threadId || null,
+        target_model: context.model,
+        request_id: context.requestId,
+        provider: context.provider,
+        model: context.model,
+        target_family: prepared.compactionGuard.targetFamily,
+      });
+      return;
+    }
+    if (prepared.compactionGuard?.action === "dropped") {
+      const formats = prepared.compactionGuard.incompatible
+        .map((capsule) => capsule.format)
+        .join(",");
+      log(`${formatRouterLog(context, "provider_switch_compaction_dropped")} target_family=${prepared.compactionGuard.targetFamily} formats=${formats || "unknown"} count=${prepared.compactionDropped}`);
+    }
     if (prepared.promptRewriteCount > 0) {
       log(`${formatRouterLog(context, "antigravity_prompt_rewrite")} replacements=${prepared.promptRewriteCount}`);
     }

@@ -46,6 +46,31 @@ def native_template() -> dict:
 
 
 class BridgeTests(unittest.TestCase):
+    def test_build_provider_handoff_excludes_private_and_developer_items(self) -> None:
+        module_spec = __import__("importlib.util").util.spec_from_file_location("bridge", SCRIPT)
+        module = __import__("importlib.util").util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as raw:
+            rollout = Path(raw) / "rollout.jsonl"
+            records = [
+                {"type": "session_meta", "payload": {"session_id": "thread-1"}},
+                {"type": "response_item", "payload": {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "secret instruction"}]}},
+                {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "implement the fix"}]}},
+                {"type": "response_item", "payload": {"type": "reasoning", "encrypted_content": "gAAAA..."}},
+                {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}},
+                {"type": "event_msg", "payload": {"type": "task_complete", "error": {"message": "provider switch required"}}},
+            ]
+            rollout.write_text("\n".join(json.dumps(item) for item in records), encoding="utf-8")
+            result = module.build_handoff_markdown(rollout, "gemini-3.8-flash-high")
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["message_count"], 2)
+            markdown = result["handoff_markdown"]
+            self.assertIn("implement the fix", markdown)
+            self.assertIn("provider switch required", markdown)
+            self.assertNotIn("secret instruction", markdown)
+            self.assertNotIn("gAAAA", markdown)
+
     def test_bundled_manifests_validate(self) -> None:
         for manifest in sorted((SCRIPT.parents[1] / "models").glob("*.json")):
             proc = run_bridge("validate-manifest", str(manifest))

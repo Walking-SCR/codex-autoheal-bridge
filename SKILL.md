@@ -42,6 +42,27 @@ Because the router cannot inspect prompt data inside a WebSocket tunnel, Gemini 
 
 This rewrite addresses the prompt-fingerprint 429 class only. An upstream `503 UNAVAILABLE` / `No capacity available for model ...` response is a separate Antigravity capacity condition and must be retried after the upstream cooldown; it is not fixed by changing local credentials or enabling Multi-Agent v2 compatibility.
 
+### Cross-provider compaction guard
+
+Codex can persist a `type=compaction` item in a long task. That item is provider-specific: OpenAI/GPT compaction capsules cannot be decoded by Antigravity Gemini/Claude, and Antigravity capsules cannot be decoded by the OpenAI route. The router inspects compaction items before forwarding JSON Responses requests.
+
+The default `CODEX_BRIDGE_PROVIDER_SWITCH_COMPACTION_MODE=fail_closed` mode blocks an incompatible or missing capsule locally with `provider_switch_compaction_conflict` and tells the user to start a new task with a plain-text summary. It does not send the known-invalid request upstream or retry it. Valid `cpa-ag-compact-v1:` capsules remain intact for Gemini/Claude routes.
+
+For that handoff, generate a provider-neutral Markdown packet from the visible rollout messages:
+
+```bash
+python3 <skill-dir>/scripts/bridge.py handoff \
+  --thread-id <thread-id> \
+  --target-model gemini-3.8-flash-high \
+  --output /tmp/codex-provider-handoff.md
+```
+
+Paste the generated packet into a new target-model task. The command deliberately excludes developer messages, encrypted reasoning, compaction capsules, and tool IDs; it transfers visible task meaning without pretending to translate private provider state.
+
+For controlled recovery only, set `CODEX_BRIDGE_PROVIDER_SWITCH_COMPACTION_MODE=drop_foreign`. The router removes incompatible compaction items, clears `previous_response_id`, preserves ordinary messages, and logs the dropped format. This may lose compressed context or increase token usage, so it is an opt-in degraded mode rather than the default.
+
+This guard is separate from prompt-fingerprint 429 handling, OAuth refresh, capacity 503s, and Multi-Agent v2 `agent_message` compatibility.
+
 When the user wants GLM-5.3 from a Coding Plan key, read [glm-coding-plan.md](references/glm-coding-plan.md). If Desktop already uses Codex Router on port 4202, add `zai-coding` there and keep the OpenAI Provider identity. Do not run `npx @z_ai/coding-helper`.
 
 On Windows, start with the isolated profile. Read [windows.md](references/windows.md). Do not require Homebrew, LaunchAgents, or Codex Router.
