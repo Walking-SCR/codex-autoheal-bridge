@@ -71,6 +71,20 @@ class BridgeTests(unittest.TestCase):
             self.assertNotIn("secret instruction", markdown)
             self.assertNotIn("gAAAA", markdown)
 
+    def test_handoff_requires_session_source_and_positive_limits(self) -> None:
+        cases = [
+            (["handoff", "--target-model", "gemini-3.8-flash-high"], "provide either --session or --thread-id"),
+            (["handoff", "--target-model", "gemini-3.8-flash-high", "--max-messages", "0"], "must be positive"),
+            (
+                ["handoff", "--target-model", "gemini-3.8-flash-high", "--max-chars-per-message", "0"],
+                "must be positive",
+            ),
+        ]
+        for arguments, expected_error in cases:
+            proc = run_bridge(*arguments)
+            self.assertEqual(proc.returncode, 2, proc.stderr or proc.stdout)
+            self.assertIn(expected_error, json.loads(proc.stdout)["error"])
+
     def test_bundled_manifests_validate(self) -> None:
         for manifest in sorted((SCRIPT.parents[1] / "models").glob("*.json")):
             proc = run_bridge("validate-manifest", str(manifest))

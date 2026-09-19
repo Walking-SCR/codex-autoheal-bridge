@@ -2142,6 +2142,15 @@ def _find_session_by_thread(thread_id: str) -> Path | None:
 
 
 def cmd_handoff(args: argparse.Namespace) -> None:
+    if args.max_messages < 1:
+        emit({"status": "blocked", "error": "--max-messages must be positive"}, 2)
+        return
+    if args.max_chars_per_message < 1:
+        emit({"status": "blocked", "error": "--max-chars-per-message must be positive"}, 2)
+        return
+    if not args.session and not args.thread_id:
+        emit({"status": "blocked", "error": "provide either --session or --thread-id"}, 2)
+        return
     session_path = Path(args.session).expanduser() if args.session else _find_session_by_thread(args.thread_id)
     if not session_path or not session_path.exists():
         emit({"status": "blocked", "error": "Codex session rollout not found; pass --session explicitly"}, 2)
