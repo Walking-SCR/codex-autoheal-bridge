@@ -34,6 +34,35 @@ Codex Desktop
 3. **Legacy Transparent Proxy Deprecation**:
    The legacy `transparent_proxy.mjs` (which blindly forwarded all models to 8317) and its LaunchAgent `com.zhijian.codex-cli-model-bridge-transparent-proxy` are permanently superseded by `codex-model-router.mjs` and `com.zhijian.codex-cli-model-bridge-router`.
 
+### Antigravity multi-account quota failover
+
+The bridge supports multiple Google AI Pro accounts through one CLIProxyAPI
+instance. Keep all Antigravity OAuth files in the configured `auth-dir`; do not
+start a second CLIProxyAPI process against the same directory. The helper below
+only prints redacted account metadata and never copies or logs OAuth tokens:
+
+```bash
+python3 <skill-dir>/scripts/antigravity_pool.py audit
+python3 <skill-dir>/scripts/antigravity_pool.py configure --apply
+python3 <skill-dir>/scripts/antigravity_pool.py login
+```
+
+The recommended policy is `routing.strategy: "fill-first"` with explicit
+credential priorities (`priority: 100` for the preferred account and `50` for
+the backup), `disable-cooling: false`, and `save-cooldown-status: true`.
+`request-retry: 0` prevents a second retry round while the first round still
+tries every eligible credential; this limits 429 cascades. `session-affinity`
+keeps an existing long conversation on its selected account until that account
+is unavailable, then binds the conversation to the fallback account.
+
+After adding an account, run `audit`, verify two distinct enabled Antigravity
+records, restart only the managed 8317 service, and probe the affected model.
+The expected failover is: preferred account receives a confirmed quota/cooldown
+signal, the same request is retried once on the backup, and a new session uses
+the preferred account again after its reset. Ambiguous short 429s must not be
+treated as permanent quota exhaustion; investigate the upstream reset signal
+before adding a supervisor quarantine.
+
 ### Antigravity prompt-fingerprint compatibility
 
 The Antigravity Gemini and Claude routes can return `429 RESOURCE_EXHAUSTED` when the request contains the exact Codex identity sentence `You are Codex, an agent based on GPT-5.`. The 8318 router rewrites that exact string to `You are a helpful AI coding assistant.` only when `route.provider` is `gemini` or `claude`; OpenAI, GLM, MiniMax, and other non-Antigravity routes are byte-for-byte unaffected.

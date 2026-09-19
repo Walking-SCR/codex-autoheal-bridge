@@ -220,6 +220,51 @@ openai-compatibility:
 cli-proxy-api -config ~/.cli-proxy-api/config.yaml -antigravity-login
 ```
 
+#### 多个 Google AI Pro 账号自动切换
+
+当一个 Google AI Pro 账号的 Antigravity 配额耗尽时，可以在同一个
+`auth-dir` 中加入第二个 OAuth 凭据，由 CLIProxyAPI 按配额冷却自动切换。
+不需要启动第二个 CLIProxyAPI，也不要让两个进程同时刷新同一个 OAuth
+目录。
+
+Skill 提供脱敏的账号池工具：
+
+```bash
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/antigravity_pool.py audit
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/antigravity_pool.py configure --apply
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/antigravity_pool.py login
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/antigravity_pool.py set-priority \
+  --file ~/.cli-proxy-api/<antigravity-auth-file>.json --priority 100 --apply
+```
+
+推荐的 `config.yaml` 策略是：
+
+```yaml
+request-retry: 0
+max-retry-credentials: 0
+disable-cooling: false
+save-cooldown-status: true
+routing:
+  strategy: "fill-first"
+  session-affinity: true
+  session-affinity-ttl: "1h"
+  session-affinity-subagents: true
+```
+
+在两个 Antigravity JSON 凭据中分别设置不同的顶层 `priority`，例如主账号
+`100`、备用账号 `50`。账号 A 收到明确的 `QUOTA_EXHAUSTED`/额度冷却信号
+后，CLIProxyAPI 会在同一请求中尝试账号 B；长对话通过 session affinity
+保持账号粘滞，避免频繁切换导致上游 Prompt Cache 丢失。`audit` 只输出脱敏
+标识，不输出邮箱、Access Token 或 Refresh Token。
+
+配置变更前会生成 `0600` 备份；完成登录后应重启 8317 并验证：两个凭据均
+已加载、正常请求命中主账号、主账号进入冷却后备用账号返回 200、两者都不可
+用时只返回一次带 `Retry-After` 的 429。
+
+本次实现还加入了账号池 JSON 校验、幂等配置更新、优先级修改备份和脱敏
+审计测试；OAuth JSON、API Key、运行时配置及本机账号状态均不属于 Skill
+仓库内容，也不会随 Skill 发布。
+
 #### 步骤 2：启动开机常驻守护服务 (macOS LaunchAgent)
 
 ```bash
