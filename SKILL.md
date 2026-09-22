@@ -75,7 +75,26 @@ This rewrite addresses the prompt-fingerprint 429 class only. An upstream `503 U
 
 Codex can persist a `type=compaction` item in a long task. That item is provider-specific: OpenAI/GPT compaction capsules cannot be decoded by Antigravity Gemini/Claude, and Antigravity capsules cannot be decoded by the OpenAI route. The router inspects compaction items before forwarding JSON Responses requests.
 
-The default `CODEX_BRIDGE_PROVIDER_SWITCH_COMPACTION_MODE=fail_closed` mode blocks an incompatible or missing capsule locally with `provider_switch_compaction_conflict` and tells the user to start a new task with a plain-text summary. It does not send the known-invalid request upstream or retry it. Valid `cpa-ag-compact-v1:` capsules remain intact for Gemini/Claude routes.
+The default `CODEX_BRIDGE_PROVIDER_SWITCH_COMPACTION_MODE=fail_closed` mode blocks an incompatible or missing capsule locally with `provider_switch_compaction_conflict`. The response includes `choice_required=true` and two stable choices: `handoff` (recommended) creates a new target-model task with a plain-text summary, while `cancel` keeps the source-model task unchanged. It does not send the known-invalid request upstream or retry it. Valid `cpa-ag-compact-v1:` capsules remain intact for Gemini/Claude routes.
+
+When this conflict is shown during a model switch, the user-facing Skill must ask the user to choose one of those two actions. Do not silently select `drop_foreign`, silently retry, or claim that the model switch succeeded. If the user chooses `handoff`, generate the packet below and create/open the target-model task. If the user chooses `cancel`, tell them to continue in the original task with its source model. The experimental `drop_foreign` mode remains an explicit maintenance override only; it is not a default dialog choice because it can discard compressed context.
+
+The native model picker remains the model-selection surface. After a picker-triggered conflict, use the Skill decision helper to make the choice explicit:
+
+```bash
+python3 <skill-dir>/scripts/bridge.py provider-switch \
+  --thread-id <thread-id> \
+  --target-model gemini-3.8-flash-high \
+  --output /tmp/codex-provider-handoff.md
+```
+
+The helper asks for `handoff` or `cancel` in an interactive terminal; in a
+non-interactive call it returns `choice_required` instead of guessing. On
+`handoff`, it writes a `0600` plain-text packet and returns
+`next_action=create_target_model_task`; the Codex task layer should create/open
+the new target-model task and paste that packet. On `cancel`, it leaves the
+source task untouched. This is a post-conflict handoff workflow; the HTTP
+router itself cannot render a native picker dialog or create a Codex task.
 
 For that handoff, generate a provider-neutral Markdown packet from the visible rollout messages:
 
@@ -91,6 +110,38 @@ Paste the generated packet into a new target-model task. The command deliberatel
 For controlled recovery only, set `CODEX_BRIDGE_PROVIDER_SWITCH_COMPACTION_MODE=drop_foreign`. The router removes incompatible compaction items, clears `previous_response_id`, preserves ordinary messages, and logs the dropped format. This may lose compressed context or increase token usage, so it is an opt-in degraded mode rather than the default.
 
 This guard is separate from prompt-fingerprint 429 handling, OAuth refresh, capacity 503s, and Multi-Agent v2 `agent_message` compatibility.
+
+### Cross-provider Responses item/state guard
+
+Compaction is not the only provider-boundary state. A long Responses task can
+also contain `previous_response_id`, `item_reference`, or provider-generated
+items such as `rs_*`, `resp_*`, `msg_*`, `fc_*`, and `fco_*`. With Codex's
+`store=false` request mode, replaying one of those IDs after switching from
+Gemini/Claude to GPT (or in the opposite direction) can produce `404 Item with
+id ... not found`; this is a stale provider-state reference, not an OAuth quota
+problem. The router deliberately does not solve it by globally forcing
+`store=true`, because that changes persistence semantics and is unsafe for a
+mixed-provider bridge.
+
+The router records only the last provider observed for each bounded
+`thread_id`/`session_id` (no prompt or credential data). When the next request
+for that task carries provider-scoped response state for a different provider,
+the default `CODEX_BRIDGE_PROVIDER_SWITCH_STATE_MODE=fail_closed` returns a
+local `409 provider_switch_state_conflict` before any upstream call. The
+native model picker remains the selection surface; the response exposes the
+same two stable choices as the compaction guard: `handoff` (recommended,
+create a new target-model task and paste a plain-text summary) or `cancel`
+(keep the source-model task). No invalid request is retried.
+
+`CODEX_BRIDGE_PROVIDER_SWITCH_STATE_MODE=drop_foreign` is an explicit degraded
+maintenance override. It removes `previous_response_id`, `item_reference`,
+reasoning items, and function-call items carrying provider-scoped IDs while
+preserving ordinary user/assistant messages. This can lose tool/reasoning
+context and must not be selected silently. The state map expires entries after
+two hours and is capped at 4096 tasks; tune with
+`CODEX_BRIDGE_PROVIDER_STATE_TTL_MS` and
+`CODEX_BRIDGE_PROVIDER_STATE_MAX_ENTRIES` only when operating a controlled
+local deployment.
 
 When the user wants GLM-5.3 from a Coding Plan key, read [glm-coding-plan.md](references/glm-coding-plan.md). If Desktop already uses Codex Router on port 4202, add `zai-coding` there and keep the OpenAI Provider identity. Do not run `npx @z_ai/coding-helper`.
 

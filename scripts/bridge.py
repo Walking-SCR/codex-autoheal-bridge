@@ -55,6 +55,18 @@ LEGACY_TRANSPARENT_LAUNCH_AGENT = Path(
 PROVIDER_ID = "cli_proxy"
 SCHEMA_VERSION = 1
 MIN_TOOL_SAFE_PROXY_VERSION = (7, 2, 130)
+PROVIDER_SWITCH_CHOICES = (
+    {
+        "id": "handoff",
+        "label": "新建目标模型任务并迁移摘要",
+        "recommended": True,
+    },
+    {
+        "id": "cancel",
+        "label": "取消切换并继续原模型任务",
+        "recommended": False,
+    },
+)
 
 
 def is_windows() -> bool:
@@ -2170,6 +2182,76 @@ def cmd_handoff(args: argparse.Namespace) -> None:
     emit(result)
 
 
+def cmd_provider_switch(args: argparse.Namespace) -> None:
+    """Resolve a native-picker provider switch after a compaction conflict.
+
+    The native picker selects the target model, while this command owns the
+    safe post-conflict decision. It never drops foreign compaction state.
+    """
+    choice = args.choice
+    if choice is None:
+        if not sys.stdin.isatty():
+            emit(
+                {
+                    "status": "choice_required",
+                    "error": "native model selection requires an explicit handoff or cancel decision",
+                    "choices": list(PROVIDER_SWITCH_CHOICES),
+                },
+                2,
+            )
+            return
+        print("检测到跨 Provider 的压缩状态冲突，请选择：", file=sys.stderr)
+        print("1) 新建目标模型任务并迁移摘要（推荐）", file=sys.stderr)
+        print("2) 取消切换并继续原模型任务", file=sys.stderr)
+        try:
+            answer = input("请选择 [1/2]: ").strip().lower()
+        except EOFError:
+            emit({"status": "choice_required", "choices": list(PROVIDER_SWITCH_CHOICES)}, 2)
+            return
+        choice = {"1": "handoff", "2": "cancel", "handoff": "handoff", "cancel": "cancel"}.get(answer)
+        if choice is None:
+            emit({"status": "blocked", "error": "choose 1/2, handoff, or cancel"}, 2)
+            return
+
+    if choice == "cancel":
+        emit(
+            {
+                "status": "cancelled",
+                "choice": "cancel",
+                "message": "Keep the source-model task unchanged and continue there.",
+            }
+        )
+        return
+
+    if args.max_messages < 1:
+        emit({"status": "blocked", "error": "--max-messages must be positive"}, 2)
+    if args.max_chars_per_message < 1:
+        emit({"status": "blocked", "error": "--max-chars-per-message must be positive"}, 2)
+    if not args.session and not args.thread_id:
+        emit({"status": "blocked", "error": "provide either --session or --thread-id"}, 2)
+    session_path = Path(args.session).expanduser() if args.session else _find_session_by_thread(args.thread_id)
+    if not session_path or not session_path.exists():
+        emit({"status": "blocked", "error": "Codex session rollout not found; pass --session explicitly"}, 2)
+
+    result = build_handoff_markdown(
+        session_path,
+        args.target_model,
+        max_messages=args.max_messages,
+        max_chars_per_message=args.max_chars_per_message,
+    )
+    result["choice"] = "handoff"
+    result["next_action"] = "create_target_model_task"
+    if args.output:
+        output = Path(args.output).expanduser()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(str(result["handoff_markdown"]), encoding="utf-8")
+        if not is_windows():
+            output.chmod(0o600)
+        result["output"] = str(output)
+        result.pop("handoff_markdown", None)
+    emit(result)
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Codex CLI model bridge")
     sub = root.add_subparsers(dest="command", required=True)
@@ -2304,6 +2386,19 @@ def parser() -> argparse.ArgumentParser:
     handoff.add_argument("--max-chars-per-message", type=int, default=4_000)
     handoff.add_argument("--output", help="Write Markdown to this path")
     handoff.set_defaults(func=cmd_handoff)
+
+    switch = sub.add_parser(
+        "provider-switch",
+        help="Ask for a safe handoff/cancel decision after native model-picker switching",
+    )
+    switch.add_argument("--target-model", required=True)
+    switch.add_argument("--session", help="Path to a Codex rollout JSONL")
+    switch.add_argument("--thread-id", help="Find the newest rollout containing this thread ID")
+    switch.add_argument("--choice", choices=["handoff", "cancel"])
+    switch.add_argument("--max-messages", type=int, default=12)
+    switch.add_argument("--max-chars-per-message", type=int, default=4_000)
+    switch.add_argument("--output", help="Write the handoff Markdown to this path")
+    switch.set_defaults(func=cmd_provider_switch)
 
     return root
 

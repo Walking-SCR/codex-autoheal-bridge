@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -84,6 +85,52 @@ class BridgeTests(unittest.TestCase):
             proc = run_bridge(*arguments)
             self.assertEqual(proc.returncode, 2, proc.stderr or proc.stdout)
             self.assertIn(expected_error, json.loads(proc.stdout)["error"])
+
+    def test_provider_switch_cancel_is_safe_and_handoff_writes_private_packet(self) -> None:
+        cancelled = run_bridge(
+            "provider-switch",
+            "--target-model",
+            "gemini-3.8-flash-high",
+            "--choice",
+            "cancel",
+        )
+        self.assertEqual(cancelled.returncode, 0, cancelled.stderr or cancelled.stdout)
+        self.assertEqual(json.loads(cancelled.stdout)["status"], "cancelled")
+
+        with tempfile.TemporaryDirectory() as raw:
+            rollout = Path(raw) / "rollout.jsonl"
+            output = Path(raw) / "handoff.md"
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"input_text": "switch safely"}],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            handed_off = run_bridge(
+                "provider-switch",
+                "--target-model",
+                "gemini-3.8-flash-high",
+                "--choice",
+                "handoff",
+                "--session",
+                str(rollout),
+                "--output",
+                str(output),
+            )
+            self.assertEqual(handed_off.returncode, 0, handed_off.stderr or handed_off.stdout)
+            result = json.loads(handed_off.stdout)
+            self.assertEqual(result["choice"], "handoff")
+            self.assertEqual(result["next_action"], "create_target_model_task")
+            self.assertTrue(output.exists())
+            if os.name != "nt":
+                self.assertEqual(output.stat().st_mode & 0o777, 0o600)
 
     def test_bundled_manifests_validate(self) -> None:
         for manifest in sorted((SCRIPT.parents[1] / "models").glob("*.json")):

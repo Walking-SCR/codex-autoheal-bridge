@@ -74,6 +74,9 @@ const DEFAULTS = Object.freeze({
   disableGptWebSockets: true,
   antigravityRefreshLeadMs: 5 * 60 * 1000,
   providerSwitchCompactionMode: "fail_closed",
+  providerSwitchStateMode: "fail_closed",
+  providerStateTtlMs: 2 * 60 * 60 * 1000,
+  providerStateMaxEntries: 4096,
 });
 
 function parsePort(value, fallback) {
@@ -100,6 +103,14 @@ function parseCompactionMode(value, fallback = DEFAULTS.providerSwitchCompaction
   return mode;
 }
 
+function parseProviderSwitchStateMode(value, fallback = DEFAULTS.providerSwitchStateMode) {
+  const mode = String(value ?? fallback).trim().toLowerCase();
+  if (mode !== "fail_closed" && mode !== "drop_foreign") {
+    throw new Error(`Invalid provider switch state mode: ${value}`);
+  }
+  return mode;
+}
+
 export function createConfig(env = process.env) {
   return {
     listenHost: env.CODEX_BRIDGE_LISTEN_HOST || DEFAULTS.listenHost,
@@ -117,6 +128,17 @@ export function createConfig(env = process.env) {
     ),
     providerSwitchCompactionMode: parseCompactionMode(
       env.CODEX_BRIDGE_PROVIDER_SWITCH_COMPACTION_MODE,
+    ),
+    providerSwitchStateMode: parseProviderSwitchStateMode(
+      env.CODEX_BRIDGE_PROVIDER_SWITCH_STATE_MODE,
+    ),
+    providerStateTtlMs: parseDuration(
+      env.CODEX_BRIDGE_PROVIDER_STATE_TTL_MS,
+      DEFAULTS.providerStateTtlMs,
+    ),
+    providerStateMaxEntries: parseDuration(
+      env.CODEX_BRIDGE_PROVIDER_STATE_MAX_ENTRIES,
+      DEFAULTS.providerStateMaxEntries,
     ),
   };
 }
@@ -598,6 +620,122 @@ export function inspectCompactionForRoute(payload, route) {
 const BLOCKED_CODEX_IDENTITY = "You are Codex, an agent based on GPT-5.";
 const SAFE_CODEX_IDENTITY = "You are a helpful AI coding assistant.";
 
+// The router cannot create a Codex task itself.  Return stable, machine-readable
+// choices so the Skill/UI can ask the user what to do after a cross-provider
+// compaction conflict instead of silently dropping context or retrying forever.
+export const PROVIDER_SWITCH_CHOICES = Object.freeze([
+  Object.freeze({
+    id: "handoff",
+    label: "Start a new target-model task with a plain-text summary",
+    label_zh: "新建目标模型任务并迁移摘要",
+    recommended: true,
+  }),
+  Object.freeze({
+    id: "cancel",
+    label: "Cancel the switch and continue with the source-model task",
+    label_zh: "取消切换并继续原模型任务",
+    recommended: false,
+  }),
+]);
+
+const PROVIDER_RESPONSE_ID = /^(?:rs|resp|msg|fc|fco)_/i;
+const PROVIDER_STATE_TYPES = new Set([
+  "reasoning",
+  "function_call",
+  "function_call_output",
+  "item_reference",
+]);
+
+function providerStateId(value) {
+  if (typeof value !== "string") return null;
+  return PROVIDER_RESPONSE_ID.test(value) ? value : null;
+}
+
+function findProviderResponseState(value, path = "$", items = []) {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => findProviderResponseState(item, `${path}[${index}]`, items));
+    return items;
+  }
+  if (!value || typeof value !== "object") return items;
+
+  for (const [key, nested] of Object.entries(value)) {
+    if (key === "previous_response_id" && typeof nested === "string") {
+      items.push({ path: `${path}.${key}`, kind: key, id: nested });
+    }
+  }
+
+  const type = typeof value.type === "string" ? value.type : "";
+  const id = providerStateId(value.id) || providerStateId(value.item_id) || providerStateId(value.response_id);
+  if (id && (PROVIDER_STATE_TYPES.has(type) || type === "" || type === "response_item") && type !== "item_reference") {
+    items.push({ path, kind: type || "id", id, type: type || null });
+  }
+  if (type === "item_reference" && (value.item_id || value.id)) {
+    items.push({
+      path,
+      kind: type,
+      id: String(value.item_id || value.id),
+      type,
+    });
+  }
+
+  for (const [key, nested] of Object.entries(value)) {
+    findProviderResponseState(nested, `${path}.${key}`, items);
+  }
+  return items;
+}
+
+/**
+ * Detects response state that is not portable between provider translators.
+ * The router only applies this guard when a session/thread has already been
+ * observed on another provider; ordinary new requests remain untouched.
+ */
+export function inspectProviderSwitchState(payload, route, previousProvider) {
+  const targetProvider = route?.provider || null;
+  const stateItems = findProviderResponseState(payload);
+  const sourceProvider = previousProvider || null;
+  const compatible = !sourceProvider || !targetProvider || sourceProvider === targetProvider || stateItems.length === 0;
+  return {
+    sourceProvider,
+    targetProvider,
+    compatible,
+    stateItems,
+    reasons: stateItems.map(({ kind, id, path }) => `${kind}:${id || path}`),
+  };
+}
+
+function stripProviderResponseState(value) {
+  let dropped = 0;
+  const visit = (item) => {
+    if (Array.isArray(item)) {
+      return item
+        .map((nested) => visit(nested))
+        .filter((nested) => nested !== undefined);
+    }
+    if (!item || typeof item !== "object") return item;
+    if (typeof item.type === "string" && PROVIDER_STATE_TYPES.has(item.type)) {
+      const id = providerStateId(item.id) || providerStateId(item.item_id) || providerStateId(item.response_id);
+      if (item.type === "item_reference" || id) {
+        dropped += 1;
+        return undefined;
+      }
+    }
+    const result = {};
+    for (const [key, nested] of Object.entries(item)) {
+      if (key === "previous_response_id") {
+        dropped += 1;
+        continue;
+      }
+      result[key] = visit(nested);
+    }
+    return result;
+  };
+  return { value: visit(value), dropped };
+}
+
+export function removeProviderScopedResponseState(payload) {
+  return stripProviderResponseState(payload);
+}
+
 function rewriteBlockedCodexIdentity(value) {
   let replacements = 0;
   const visit = (item) => {
@@ -623,6 +761,8 @@ export function sanitizeBodyForRoute(bodyBuffer, requestHeaders, route, options 
       promptRewriteCount: 0,
       compactionGuard: null,
       compactionDropped: 0,
+      providerSwitchGuard: null,
+      providerStateDropped: 0,
     };
   }
   const encoding = String(requestHeaders["content-encoding"] || "").toLowerCase();
@@ -635,8 +775,47 @@ export function sanitizeBodyForRoute(bodyBuffer, requestHeaders, route, options 
     let promptRewriteCount = 0;
     const compactionInspection = inspectCompactionForRoute(sanitized, route);
     const compactionMode = options.providerSwitchCompactionMode || "fail_closed";
+    const providerStateMode = options.providerSwitchStateMode || "fail_closed";
     let compactionGuard = null;
     let compactionDropped = 0;
+    let providerSwitchGuard = null;
+    let providerStateDropped = 0;
+
+    const stateInspection = inspectProviderSwitchState(
+      sanitized,
+      route,
+      options.previousProvider,
+    );
+    if (!stateInspection.compatible) {
+      if (providerStateMode === "drop_foreign") {
+        const stripped = removeProviderScopedResponseState(sanitized);
+        sanitized = stripped.value;
+        providerStateDropped = stripped.dropped;
+        providerSwitchGuard = {
+          action: "dropped",
+          sourceProvider: stateInspection.sourceProvider,
+          targetProvider: stateInspection.targetProvider,
+          reasons: stateInspection.reasons,
+        };
+        changed ||= providerStateDropped > 0;
+      } else {
+        providerSwitchGuard = {
+          action: "blocked",
+          sourceProvider: stateInspection.sourceProvider,
+          targetProvider: stateInspection.targetProvider,
+          reasons: stateInspection.reasons,
+        };
+        return {
+          buffer: bodyBuffer,
+          changed: false,
+          promptRewriteCount: 0,
+          compactionGuard: null,
+          compactionDropped: 0,
+          providerSwitchGuard,
+          providerStateDropped: 0,
+        };
+      }
+    }
     if (!compactionInspection.compatible) {
       const incompatible = compactionInspection.incompatible;
       if (compactionMode === "drop_foreign") {
@@ -663,6 +842,8 @@ export function sanitizeBodyForRoute(bodyBuffer, requestHeaders, route, options 
           promptRewriteCount: 0,
           compactionGuard,
           compactionDropped: 0,
+          providerSwitchGuard,
+          providerStateDropped,
         };
       }
     }
@@ -686,11 +867,21 @@ export function sanitizeBodyForRoute(bodyBuffer, requestHeaders, route, options 
         promptRewriteCount: 0,
         compactionGuard,
         compactionDropped,
+        providerSwitchGuard,
+        providerStateDropped,
       };
     }
     let output = Buffer.from(JSON.stringify(sanitized));
     if (encoding === "zstd") output = zstdCompressSync(output);
-    return { buffer: output, changed: true, promptRewriteCount, compactionGuard, compactionDropped };
+    return {
+      buffer: output,
+      changed: true,
+      promptRewriteCount,
+      compactionGuard,
+      compactionDropped,
+      providerSwitchGuard,
+      providerStateDropped,
+    };
   } catch {
     // Never guess or corrupt an opaque request.  The route remains explicit;
     // Codex/upstream will return the original protocol error if it is opaque.
@@ -700,6 +891,8 @@ export function sanitizeBodyForRoute(bodyBuffer, requestHeaders, route, options 
       promptRewriteCount: 0,
       compactionGuard: null,
       compactionDropped: 0,
+      providerSwitchGuard: null,
+      providerStateDropped: 0,
     };
   }
 }
@@ -749,9 +942,37 @@ function requestModule(target) {
 export function createRouterServer(options = {}) {
   const config = { ...createConfig(), ...options.config };
   const log = options.log || ((line) => process.stderr.write(`${line}\n`));
+  const providerStateBySession = new Map();
   const requestImpl = options.requestImpl || ((target, requestOptions, callback) => {
     return requestModule(target).request(target, requestOptions, callback);
   });
+
+  function providerStateKey(context) {
+    const id = context.threadId || context.sessionId;
+    return id ? String(id) : null;
+  }
+
+  function previousProviderFor(context) {
+    const key = providerStateKey(context);
+    if (!key) return { key: null, provider: null };
+    const current = providerStateBySession.get(key);
+    if (!current || Date.now() - current.seenAt > config.providerStateTtlMs) {
+      if (current) providerStateBySession.delete(key);
+      return { key, provider: null };
+    }
+    return { key, provider: current.provider };
+  }
+
+  function rememberProvider(key, provider) {
+    if (!key || !provider) return;
+    providerStateBySession.delete(key);
+    providerStateBySession.set(key, { provider, seenAt: Date.now() });
+    while (providerStateBySession.size > config.providerStateMaxEntries) {
+      const oldest = providerStateBySession.keys().next().value;
+      if (oldest === undefined) break;
+      providerStateBySession.delete(oldest);
+    }
+  }
 
   async function handleRequest(request, response) {
     if (request.url === "/__codex_bridge_health") {
@@ -769,6 +990,7 @@ export function createRouterServer(options = {}) {
           cliProxy: config.cliProxyBaseUrl,
         },
         providerSwitchCompactionMode: config.providerSwitchCompactionMode,
+        providerSwitchStateMode: config.providerSwitchStateMode,
       });
       return;
     }
@@ -870,9 +1092,31 @@ export function createRouterServer(options = {}) {
       return;
     }
 
+    const state = previousProviderFor(context);
     const prepared = sanitizeBodyForRoute(body, request.headers, route, {
       providerSwitchCompactionMode: config.providerSwitchCompactionMode,
+      providerSwitchStateMode: config.providerSwitchStateMode,
+      previousProvider: state.provider,
     });
+    if (prepared.providerSwitchGuard?.action === "blocked") {
+      log(`${formatRouterLog(context, "provider_switch_state_blocked")} source_provider=${safeId(prepared.providerSwitchGuard.sourceProvider)} target_provider=${safeId(prepared.providerSwitchGuard.targetProvider)} reasons=${safeId(prepared.providerSwitchGuard.reasons.join(","))}`);
+      responseJson(response, 409, {
+        error: "provider_switch_state_conflict",
+        message: "This conversation contains response items from another model provider. Choose handoff to create a new target-model task with a plain-text summary, or cancel the switch.",
+        retryable: false,
+        handoff_required: true,
+        choice_required: true,
+        choices: PROVIDER_SWITCH_CHOICES,
+        handoff_mode: "new_task_with_plain_text_summary",
+        source_thread_id: context.threadId || null,
+        source_provider: prepared.providerSwitchGuard.sourceProvider,
+        target_provider: prepared.providerSwitchGuard.targetProvider,
+        target_model: context.model,
+        reasons: prepared.providerSwitchGuard.reasons,
+        request_id: context.requestId,
+      });
+      return;
+    }
     if (prepared.compactionGuard?.action === "blocked") {
       const formats = prepared.compactionGuard.incompatible
         .map((capsule) => capsule.format)
@@ -883,6 +1127,8 @@ export function createRouterServer(options = {}) {
         message: "This conversation contains a compaction state from another model provider. Start a new conversation for the selected model and paste a summary of the previous context.",
         retryable: false,
         handoff_required: true,
+        choice_required: true,
+        choices: PROVIDER_SWITCH_CHOICES,
         handoff_mode: "new_task_with_plain_text_summary",
         source_thread_id: context.threadId || null,
         target_model: context.model,
@@ -898,6 +1144,9 @@ export function createRouterServer(options = {}) {
         .map((capsule) => capsule.format)
         .join(",");
       log(`${formatRouterLog(context, "provider_switch_compaction_dropped")} target_family=${prepared.compactionGuard.targetFamily} formats=${formats || "unknown"} count=${prepared.compactionDropped}`);
+    }
+    if (prepared.providerSwitchGuard?.action === "dropped") {
+      log(`${formatRouterLog(context, "provider_switch_state_dropped")} source_provider=${safeId(prepared.providerSwitchGuard.sourceProvider)} target_provider=${safeId(prepared.providerSwitchGuard.targetProvider)} count=${prepared.providerStateDropped}`);
     }
     if (prepared.promptRewriteCount > 0) {
       log(`${formatRouterLog(context, "antigravity_prompt_rewrite")} replacements=${prepared.promptRewriteCount}`);
@@ -919,6 +1168,7 @@ export function createRouterServer(options = {}) {
       log(formatRouterLog(context, "upstream_error"));
       responseJson(response, 502, publicError(error, context));
     });
+    rememberProvider(state.key, route.provider);
     upstreamRequest.end(prepared.buffer);
   }
 
