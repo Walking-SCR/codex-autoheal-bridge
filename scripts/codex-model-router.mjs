@@ -1237,6 +1237,47 @@ export function createRouterServer(options = {}) {
   return server;
 }
 
+
+export function autoSyncCatalogOnStartup(log = () => {}) {
+  try {
+    const scriptPath = path.join(
+      process.env.HOME || process.env.USERPROFILE || os.homedir(),
+      ".codex",
+      "skills",
+      "codex-autoheal-bridge",
+      "scripts",
+      "auto_sync_official.py"
+    );
+    if (!fs.existsSync(scriptPath)) return;
+    const pythonBin = process.env.CODEX_BRIDGE_PYTHON || process.env.PYTHON || "python3";
+    const out = execFileSync(pythonBin, [scriptPath], { encoding: "utf8", timeout: 8000 });
+    log(`[router] event=auto_sync_catalog result=${out.trim().replace(/\s+/g, " ")}`);
+  } catch (err) {
+    log(`[router] event=auto_sync_catalog_error error=${err?.message || err}`);
+  }
+}
+
+export function watchNativeModelsCache(log = () => {}) {
+  try {
+    const nativeCache = path.join(
+      process.env.HOME || process.env.USERPROFILE || os.homedir(),
+      ".codex",
+      "models_cache.json"
+    );
+    if (!fs.existsSync(nativeCache)) return;
+    let debounceTimer = null;
+    fs.watch(nativeCache, (eventType) => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        log(`[router] event=native_cache_changed event_type=${eventType}`);
+        autoSyncCatalogOnStartup(log);
+      }, 3000);
+    });
+  } catch (err) {
+    log(`[router] event=watch_native_cache_error error=${err?.message || err}`);
+  }
+}
+
 export function startRouter(options = {}) {
   const config = options.config || createConfig();
   const server = options.server || createRouterServer({ ...options, config });
@@ -1244,6 +1285,11 @@ export function startRouter(options = {}) {
     process.stdout.write(
       `Codex model router listening on http://${config.listenHost}:${config.listenPort}/v1\n`,
     );
+    try {
+      const logFn = options.log || ((msg) => process.stdout.write(`${msg}\n`));
+      autoSyncCatalogOnStartup(logFn);
+      watchNativeModelsCache(logFn);
+    } catch (_) {}
   });
   const shutdown = () => server.close(() => process.exit(0));
   process.on("SIGINT", shutdown);
