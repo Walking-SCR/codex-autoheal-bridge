@@ -55,6 +55,39 @@ tries every eligible credential; this limits 429 cascades. `session-affinity`
 keeps an existing long conversation on its selected account until that account
 is unavailable, then binds the conversation to the fallback account.
 
+### Antigravity quota-proximity priority rebalance
+
+Accounts in the Antigravity pool are dynamically prioritized by quota reset timing and tier capacity:
+
+```bash
+python3 <skill-dir>/scripts/antigravity_pool.py rebalance
+python3 <skill-dir>/scripts/antigravity_pool.py rebalance --apply
+```
+
+1. **Primary criterion (Proximity to Reset)**: Accounts whose quota resets soonest are prioritized. Accounts within an imminent reset window (default: <= 2 hours) receive high-tier priority (800~999) to drain remaining capacity before window expiration and avoid quota waste.
+2. **Secondary criterion (Remaining Quota & Tier)**: In normal active windows, Pro tier accounts (`standard-tier` / `g1-pro-tier`) are prioritized over Free tier accounts (`free-tier`).
+3. **Cooling & Blocked Handling**: Accounts in 429 cooldown receive low cooling priority (100~200) ranked by earliest recovery time so they automatically step in upon cooldown expiration. Blocked or `VALIDATION_REQUIRED` accounts receive priority 0.
+4. **Automated Scheduling**: The 8318 Router runs rebalancing on startup, periodically every 15 minutes, and reactively debounced upon receiving an upstream 429 quota exhaustion signal.
+
+When Google returns `403 VALIDATION_REQUIRED`, follow
+[references/antigravity-validation.md](references/antigravity-validation.md).
+Do not run the generic `login` command blindly: first enumerate the exact
+affected accounts, obtain authorization for that account list, then launch
+OAuth one account at a time and verify the saved account before proceeding.
+Never print or paste the stored `validation_url`; it contains opaque
+account-specific flow parameters.
+
+When the 8318 router returns `antigravity_account_action_required`, it has
+confirmed that every enabled Antigravity credential for the requested Gemini
+model is in a current validation or quota cooldown. Treat it as a terminal
+account action, not a transient 503: do not retry or launch another OAuth flow
+automatically. Explain the blocked-account categories using the redacted
+`validation-plan` and offer to wait/verify or explicitly start a new task on a
+different model with a plain-text summary. Never silently switch the model,
+reuse provider-scoped Responses state, or expose account emails or Google
+validation URLs in the router response. A successful Codex-level probe is still
+required before declaring the Gemini route recovered.
+
 After adding an account, run `audit`, verify two distinct enabled Antigravity
 records, restart only the managed 8317 service, and probe the affected model.
 The expected failover is: preferred account receives a confirmed quota/cooldown
@@ -62,6 +95,19 @@ signal, the same request is retried once on the backup, and a new session uses
 the preferred account again after its reset. Ambiguous short 429s must not be
 treated as permanent quota exhaustion; investigate the upstream reset signal
 before adding a supervisor quarantine.
+
+### Antigravity VALIDATION_REQUIRED (account verification) self-healing
+
+When Codex receives `503 auth_unavailable` whose last upstream error contains `403 VALIDATION_REQUIRED` / "Verify your account to continue", Google has flagged account-level verification. **OAuth re-login (`login-validation`) does NOT clear this wall** (verified 2026-09-26). The only verified fix is completing Google's own challenge at the per-account `validation_url` embedded in the 403 body, then clearing the `.cds` cooldown files AND restarting CLIProxyAPI (cooldown is in-memory; deleting files alone is not enough).
+
+Run the automated flow — preview first, then apply:
+
+```bash
+python3 <skill-dir>/scripts/antigravity_pool.py validation-fix --model gemini-3.8-flash-high          # 预览
+python3 <skill-dir>/scripts/antigravity_pool.py validation-fix --model gemini-3.8-flash-high --apply --restart
+```
+
+The helper opens each account's verification page serially (user completes the Google challenge), backs up and deletes the cds files, kickstarts the CLIProxyAPI launchd service, and probes `/v1/responses` to classify the result (recovered / still blocked / quota exhausted). Full runbook: [references/antigravity-validation.md](references/antigravity-validation.md). If the probe reports 429 `RESOURCE_EXHAUSTED`, verification succeeded — the remaining issue is quota and must wait for reset.
 
 ### Antigravity prompt-fingerprint compatibility
 
@@ -377,10 +423,10 @@ Report:
 
 ## Repair workflow
 
-1. Audit and distinguish history-scope mismatch, invalid TOML, proxy-down, helper/auth failure, missing route, invalid profile catalog, stale task, and Provider protocol mismatch.
+1. Audit and distinguish history-scope mismatch, invalid TOML, proxy-down, helper/auth failure, missing route, invalid profile catalog, stale task, and Provider protocol mismatch. If the upstream body contains `403 VALIDATION_REQUIRED`, enumerate affected Antigravity accounts with the validation workflow before attempting OAuth.
 2. Restore the dominant history Provider before model work; do not rewrite task rows.
 3. Repair the smallest failing layer; do not reinstall a healthy proxy.
-4. Re-authorize upstream Providers with the WorkBuddy bridge only when CLIProxyAPI authentication is actually absent or rejected.
+4. Re-authorize upstream Providers only when CLIProxyAPI authentication is actually absent or rejected. For Google `VALIDATION_REQUIRED`, use the targeted sequential login workflow; never log in every configured account or silently accept whichever Google account the browser defaults to.
 5. Re-run profile catalog sync and the affected Codex-level probes.
 6. Verify normal desktop history remains visible under the default Provider.
 
