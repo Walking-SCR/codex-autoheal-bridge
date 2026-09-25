@@ -294,7 +294,8 @@ model_catalog_json = "~/.codex/model-catalog-cli-proxy.json"
 
 | 报错信息                                     | 真实原因                                                   | 解决方式                                                                      |
 | :------------------------------------------- | :--------------------------------------------------------- | :---------------------------------------------------------------------------- |
-| `503 auth_unavailable`                     | 本地 Token 过期且未触发自愈                                | 8318 路由现已自动静默处理；若授权被手动撤销，重新运行一次登录命令即可         |
+| `503 auth_unavailable`（last upstream error 为 Token 过期/401 类） | 本地 Token 过期且未触发自愈                                | 8318 路由现已自动静默处理；若授权被手动撤销，重新运行一次登录命令即可         |
+| `503 auth_unavailable`（last upstream error 含 `403 VALIDATION_REQUIRED` / "Verify your account to continue"） | Google 对账号级的验证拦截，**不是 Token 过期**；实测 OAuth 重新登录无法解除 | 运行 `antigravity_pool.py validation-fix --model <模型> --apply --restart`：自动打开各账号专属验证页（浏览器中完成 Google 验证）→ 清除冷却文件 → 重启代理 → 自动探测恢复结果。注意冷却状态在内存中，仅删 `.cds` 文件不重启无效 |
 | `503 upstream stream closed before [DONE]` | 厂商流式结束未发`[DONE]` 终结符（如 MiniMax）            | 8318 已内置`__sse_shim` 垫片透明补齐，通过 `add-model` 即可自动识别并挂载 |
 | `missing field support_verbosity`          | 手动修改模型目录时遗漏了 Rust 强类型必填字段               | 使用`bridge.py add-model` 自动深拷贝生成，杜绝手动修改 JSON 出错            |
 | `503 MODEL_CAPACITY_EXHAUSTED`             | Google Antigravity 服务端模型配额暂时满载（多见于 Claude） | 属于云端服务器暂时排队，本地配置完好，换用 Gemini 即可                        |
@@ -451,6 +452,7 @@ python3 ~/.codex/skills/codex-autoheal-bridge/scripts/bridge.py add-model \
 
 | Symptom | Meaning | Action |
 | :--- | :--- | :--- |
+| `503 auth_unavailable` whose last upstream error contains `403 VALIDATION_REQUIRED` / "Verify your account to continue" | Google account-level verification wall, **not** an expired token; verified that OAuth re-login alone does NOT clear it | Run `antigravity_pool.py validation-fix --model <model> --apply --restart`: it opens each account's dedicated verification page (complete the Google challenge in the browser), clears the cooldown files, restarts CLIProxyAPI, and probes recovery. Cooldown lives in memory — deleting `.cds` files without a restart is not enough |
 | `429 RESOURCE_EXHAUSTED` only with the full Codex prompt | Antigravity matched the fixed Codex identity prompt fingerprint | The Router rewrites the sentence only for Gemini / Claude and forces their WebSocket attempts to HTTP; check for `antigravity_prompt_rewrite` in the router log |
 | `503 No capacity available for model ...` | The upstream model has no serving capacity temporarily | Wait for the provider cooldown and retry; do not rotate local OAuth credentials |
 | `404 Item with id 'rs_...' not found` or `store=false` errors | A conversation switched providers while carrying another provider's Responses item or `previous_response_id` | Follow the local 409 choice: hand off to a new target-model task with a plain-text summary, or cancel the switch. Do not globally force `store=true`; `CODEX_BRIDGE_PROVIDER_SWITCH_STATE_MODE=drop_foreign` is an explicit degraded option that can lose tool/reasoning context |
