@@ -73,6 +73,7 @@ const DEFAULTS = Object.freeze({
   requestTimeoutMs: 120_000,
   disableGptWebSockets: true,
   antigravityRefreshLeadMs: 5 * 60 * 1000,
+  antigravityRebalanceIntervalMs: 15 * 60 * 1000,
   providerSwitchCompactionMode: "fail_closed",
   providerSwitchStateMode: "fail_closed",
   providerStateTtlMs: 2 * 60 * 60 * 1000,
@@ -125,6 +126,10 @@ export function createConfig(env = process.env) {
     antigravityRefreshLeadMs: parseDuration(
       env.CODEX_BRIDGE_ANTIGRAVITY_REFRESH_LEAD_MS,
       DEFAULTS.antigravityRefreshLeadMs,
+    ),
+    antigravityRebalanceIntervalMs: parseDuration(
+      env.CODEX_BRIDGE_ANTIGRAVITY_REBALANCE_INTERVAL_MS,
+      DEFAULTS.antigravityRebalanceIntervalMs,
     ),
     providerSwitchCompactionMode: parseCompactionMode(
       env.CODEX_BRIDGE_PROVIDER_SWITCH_COMPACTION_MODE,
@@ -924,6 +929,140 @@ function responseJson(response, status, payload) {
   response.end(JSON.stringify(payload));
 }
 
+const MAX_CLASSIFIED_ERROR_BYTES = 64 * 1024;
+
+function readJsonIfPresent(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Only turn an Antigravity pool exhaustion into an action-required error when
+ * every enabled credential has a current, model-relevant cooldown.  The 503's
+ * last upstream error is historical and is not enough to classify the pool.
+ * Never return or log credential contents, account emails, or validation URLs.
+ */
+export function classifyAntigravityAuthUnavailable(status, bodyBuffer, authDir, model, now = Date.now()) {
+  if (status !== 503 || !/^gemini-/i.test(String(model || ""))) return null;
+  let upstream;
+  try {
+    upstream = JSON.parse(bodyBuffer.toString("utf8"));
+  } catch {
+    return null;
+  }
+  const message = upstream?.error?.message;
+  if (typeof message !== "string" ||
+      !/^auth_unavailable:\s*no auth available\b/i.test(message) ||
+      !/providers=antigravity(?:[,;)\s]|$)/i.test(message) ||
+      !message.includes(`model=${model}`)) return null;
+
+  let files;
+  try {
+    files = fs.readdirSync(authDir);
+  } catch {
+    return null;
+  }
+  const statusByAuthId = new Map();
+  for (const name of files.filter((entry) => entry.endsWith(".cds"))) {
+    const data = readJsonIfPresent(path.join(authDir, name));
+    if (data?.provider === "antigravity" && typeof data.auth_id === "string") {
+      statusByAuthId.set(data.auth_id, data.records);
+    }
+  }
+  let enabled = 0;
+  let validation = 0;
+  let quota = 0;
+  let nextCheck = Infinity;
+  for (const name of files.filter((entry) => entry.endsWith(".json"))) {
+    const auth = readJsonIfPresent(path.join(authDir, name));
+    if (auth?.type !== "antigravity" || auth.disabled === true) continue;
+    enabled += 1;
+    const records = statusByAuthId.get(name);
+    if (!Array.isArray(records)) return null;
+    const blocked = records.filter((record) =>
+      (record?.model === model || !record?.model) &&
+      record?.status === "cooling" &&
+      Date.parse(record.next_retry_after) > now
+    );
+    if (blocked.length === 0) return null;
+    nextCheck = Math.min(nextCheck, ...blocked.map((record) => Date.parse(record.next_retry_after)));
+    if (blocked.some((record) =>
+      record.last_error?.http_status === 403 &&
+      /VALIDATION_REQUIRED/i.test(`${record.reason || ""} ${record.last_error?.message || ""}`)
+    )) {
+      validation += 1;
+    } else if (blocked.some((record) =>
+      record.last_error?.http_status === 429 || record.quota?.exceeded === true
+    )) {
+      quota += 1;
+    } else {
+      return null;
+    }
+  }
+  if (enabled === 0 || validation === 0 || validation + quota !== enabled) return null;
+  return { enabled, validation, quota, nextCheckAt: new Date(nextCheck).toISOString() };
+}
+
+function forwardWithPoolFailureGuard(upstream, response, route, context, config, log) {
+  const status = upstream.statusCode || 502;
+  if (route.provider !== "gemini" || status !== 503 ||
+      upstream.headers["content-encoding"] ||
+      !String(upstream.headers["content-type"] || "").includes("application/json")) {
+    response.writeHead(status, upstream.headers);
+    upstream.pipe(response);
+    return;
+  }
+  const chunks = [];
+  let size = 0;
+  const onData = (chunk) => {
+    size += chunk.length;
+    chunks.push(chunk);
+    if (size > MAX_CLASSIFIED_ERROR_BYTES) {
+      upstream.off("data", onData);
+      upstream.off("end", onEnd);
+      response.writeHead(status, upstream.headers);
+      response.write(Buffer.concat(chunks));
+      upstream.pipe(response);
+    }
+  };
+  const onEnd = () => {
+    const raw = Buffer.concat(chunks);
+    const pool = classifyAntigravityAuthUnavailable(status, raw, config.authDir, context.model);
+    if (!pool) {
+      response.writeHead(status, upstream.headers);
+      response.end(raw);
+      return;
+    }
+    log(`${formatRouterLog(context, "antigravity_pool_action_required")} validation=${pool.validation} quota=${pool.quota}`);
+    // Codex 0.155.0-alpha retries 403/409/422/424 stream failures six times;
+    // a model-scoped 400 with an explicit code terminates after one request.
+    responseJson(response, 400, {
+      error: {
+        type: "upstream_account_action_required",
+        code: "antigravity_account_action_required",
+        message: `No eligible Antigravity account for this Gemini model. ${pool.quota > 0
+          ? "Google account verification is required for some accounts; the remaining accounts are in quota cooldown."
+          : "Google account verification is required for every enabled account."} Repeating OAuth login or this request will not resolve it. Verify the affected Google accounts, or explicitly choose another model in a new task with a plain-text summary. The router will not switch providers silently.`,
+      },
+      retryable: false,
+      action_required: true,
+      handoff_available: true,
+      handoff_mode: "new_task_with_plain_text_summary",
+      next_check_at: pool.nextCheckAt,
+      request_id: context.requestId,
+    });
+  };
+  upstream.on("data", onData);
+  upstream.once("end", onEnd);
+  upstream.once("error", (error) => {
+    log(`${formatRouterLog(context, "upstream_response_error")} cause=${safeId(error?.code || "stream_error")}`);
+    responseJson(response, 502, publicError(error, context));
+  });
+}
+
 function publicError(error, context) {
   return {
     error: "upstream_unavailable",
@@ -1160,8 +1299,10 @@ export function createRouterServer(options = {}) {
       headers,
     };
     const upstreamRequest = requestImpl(target, requestOptions, (upstreamResponse) => {
-      response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
-      upstreamResponse.pipe(response);
+      if (upstreamResponse.statusCode === 429 && (route.provider === "gemini" || route.provider === "claude")) {
+        scheduleFastRebalanceOnQuota(log);
+      }
+      forwardWithPoolFailureGuard(upstreamResponse, response, route, context, config, log);
     });
     upstreamRequest.setTimeout(config.requestTimeoutMs, () => upstreamRequest.destroy(new Error("upstream_timeout")));
     upstreamRequest.on("error", (error) => {
@@ -1278,6 +1419,52 @@ export function watchNativeModelsCache(log = () => {}) {
   }
 }
 
+let fastRebalanceTimer = null;
+export function scheduleFastRebalanceOnQuota(log = () => {}) {
+  if (fastRebalanceTimer) return;
+  fastRebalanceTimer = setTimeout(() => {
+    fastRebalanceTimer = null;
+    log("[router] event=trigger_fast_rebalance_on_quota");
+    autoRebalanceAntigravityPool(log);
+  }, 1500);
+  if (fastRebalanceTimer.unref) fastRebalanceTimer.unref();
+}
+
+export function autoRebalanceAntigravityPool(log = () => {}) {
+  try {
+    const scriptPath = path.join(
+      process.env.HOME || process.env.USERPROFILE || os.homedir(),
+      ".codex",
+      "skills",
+      "codex-autoheal-bridge",
+      "scripts",
+      "antigravity_pool.py"
+    );
+    if (!fs.existsSync(scriptPath)) return;
+    const pythonBin = process.env.CODEX_BRIDGE_PYTHON || process.env.PYTHON || "python3";
+    const out = execFileSync(pythonBin, [scriptPath, "rebalance", "--apply"], {
+      encoding: "utf8",
+      timeout: 10000,
+    });
+    const summary = out
+      .trim()
+      .split("\n")
+      .filter((l) => l.includes("updated=") || l.includes("rebalance complete"))
+      .join("; ");
+    log(`[router] event=auto_rebalance_antigravity ${summary || "pool up to date"}`);
+  } catch (err) {
+    log(`[router] event=auto_rebalance_antigravity_error error=${err?.message || err}`);
+  }
+}
+
+export function startPeriodicAntigravityRebalance(intervalMs = 15 * 60 * 1000, log = () => {}) {
+  const timer = setInterval(() => {
+    autoRebalanceAntigravityPool(log);
+  }, intervalMs);
+  if (timer.unref) timer.unref();
+  return timer;
+}
+
 export function startRouter(options = {}) {
   const config = options.config || createConfig();
   const server = options.server || createRouterServer({ ...options, config });
@@ -1289,6 +1476,8 @@ export function startRouter(options = {}) {
       const logFn = options.log || ((msg) => process.stdout.write(`${msg}\n`));
       autoSyncCatalogOnStartup(logFn);
       watchNativeModelsCache(logFn);
+      autoRebalanceAntigravityPool(logFn);
+      startPeriodicAntigravityRebalance(config.antigravityRebalanceIntervalMs, logFn);
     } catch (_) {}
   });
   const shutdown = () => server.close(() => process.exit(0));
