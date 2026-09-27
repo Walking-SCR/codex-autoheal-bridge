@@ -11,6 +11,7 @@ import os from "node:os";
 import tls from "node:tls";
 import { zstdCompressSync, zstdDecompressSync } from "node:zlib";
 import { URL } from "node:url";
+import { performance } from "node:perf_hooks";
 
 /**
  * Model routing is intentionally centralized here.  A model selection must
@@ -58,7 +59,7 @@ export const ROUTE_TABLE = Object.freeze([
     provider: "thirdparty",
     transport: "bridge",
     upstream: "cliProxy",
-    matches: (model) => /^(?:minimax|qwen-|kimi-|moonshot-|doubao-|baichuan-|yi-|llama-|mistral-)/i.test(model),
+    matches: (model) => /^(?:minimax|qwen-|kimi-|moonshot-|doubao-|baichuan-|yi-|llama-|mistral-|grok-|zai-|custom-)/i.test(model),
   }),
 ]);
 
@@ -439,6 +440,261 @@ export function formatRouterLog(context, event = "route") {
   ].join(" ");
 }
 
+export class SlidingWindow {
+  constructor(capacity = 1000) {
+    this.capacity = capacity;
+    this.buffer = new Float32Array(capacity);
+    this.head = 0;
+    this.count = 0;
+  }
+
+  push(value) {
+    if (typeof value !== "number" || Number.isNaN(value) || !Number.isFinite(value)) return;
+    this.buffer[this.head] = value;
+    this.head = (this.head + 1) % this.capacity;
+    this.count += 1;
+  }
+
+  size() {
+    return Math.min(this.count, this.capacity);
+  }
+
+  reset() {
+    this.head = 0;
+    this.count = 0;
+    this.buffer.fill(0);
+  }
+
+  values() {
+    const size = this.size();
+    if (size === 0) return new Float32Array(0);
+    const result = new Float32Array(size);
+    if (this.count <= this.capacity) {
+      result.set(this.buffer.subarray(0, size));
+    } else {
+      const tailPart = this.buffer.subarray(this.head, this.capacity);
+      const headPart = this.buffer.subarray(0, this.head);
+      result.set(tailPart, 0);
+      result.set(headPart, tailPart.length);
+    }
+    return result;
+  }
+
+  summary() {
+    const size = this.size();
+    if (size === 0) {
+      return { count: 0, sample_size: 0, min: 0, max: 0, avg: 0, p50: 0, p95: 0 };
+    }
+    const vals = this.values();
+    vals.sort();
+    let sum = 0;
+    for (let i = 0; i < vals.length; i++) {
+      sum += vals[i];
+    }
+    const avg = Number((sum / vals.length).toFixed(2));
+    const min = Number(vals[0].toFixed(2));
+    const max = Number(vals[vals.length - 1].toFixed(2));
+
+    const percentile = (p) => {
+      const idx = (vals.length - 1) * p;
+      const lower = Math.floor(idx);
+      const upper = Math.ceil(idx);
+      const weight = idx - lower;
+      if (lower === upper) return Number(vals[lower].toFixed(2));
+      const interpolated = vals[lower] * (1 - weight) + vals[upper] * weight;
+      return Number(interpolated.toFixed(2));
+    };
+
+    return {
+      count: this.count,
+      sample_size: size,
+      min,
+      max,
+      avg,
+      p50: percentile(0.5),
+      p95: percentile(0.95),
+    };
+  }
+}
+
+export class RequestTracker {
+  constructor(collector, tIncoming) {
+    this.collector = collector;
+    this.tIncoming = tIncoming;
+    this.completed = false;
+  }
+
+  finish(data = {}) {
+    if (this.completed) return;
+    this.completed = true;
+    const totalMs = data.totalMs ?? Math.max(0, performance.now() - this.tIncoming);
+    this.collector.recordRequest({
+      ...data,
+      totalMs,
+    });
+  }
+
+  cancel() {
+    if (this.completed) return;
+    this.completed = true;
+    this.collector.totalRequests += 1;
+    if (this.collector.activeRequests > 0) {
+      this.collector.activeRequests -= 1;
+    }
+  }
+}
+
+export class MetricsCollector {
+  constructor(windowCapacity = 1000) {
+    this.windowCapacity = windowCapacity;
+    this.totalRequests = 0;
+    this.activeRequests = 0;
+    this.reusedSockets = 0;
+    this.newSockets = 0;
+
+    this.latencies = {
+      ingress_ms: new SlidingWindow(windowCapacity),
+      sanitize_ms: new SlidingWindow(windowCapacity),
+      queue_ms: new SlidingWindow(windowCapacity),
+      dns_ms: new SlidingWindow(windowCapacity),
+      connect_ms: new SlidingWindow(windowCapacity),
+      tls_ms: new SlidingWindow(windowCapacity),
+      handshake_total_ms: new SlidingWindow(windowCapacity),
+      ttfb_ms: new SlidingWindow(windowCapacity),
+      ttft_ms: new SlidingWindow(windowCapacity),
+      total_ms: new SlidingWindow(windowCapacity),
+    };
+
+    this.byUpstream = new Map();
+  }
+
+  _getUpstreamCollector(upstream) {
+    const key = upstream || "unknown";
+    if (!this.byUpstream.has(key)) {
+      this.byUpstream.set(key, {
+        totalRequests: 0,
+        reusedSockets: 0,
+        newSockets: 0,
+        ttfb_ms: new SlidingWindow(this.windowCapacity),
+        ttft_ms: new SlidingWindow(this.windowCapacity),
+        total_ms: new SlidingWindow(this.windowCapacity),
+      });
+    }
+    return this.byUpstream.get(key);
+  }
+
+  startRequest(tIncoming = performance.now()) {
+    this.activeRequests += 1;
+    return new RequestTracker(this, tIncoming);
+  }
+
+  recordRequest({
+    upstream,
+    reusedSocket = false,
+    ingressMs = 0,
+    sanitizeMs = 0,
+    queueMs = 0,
+    dnsMs = 0,
+    connectMs = 0,
+    tlsMs = 0,
+    handshakeMs = 0,
+    ttfbMs = 0,
+    ttftMs = 0,
+    totalMs = 0,
+  } = {}) {
+    this.totalRequests += 1;
+    if (this.activeRequests > 0) {
+      this.activeRequests -= 1;
+    }
+
+    if (reusedSocket) {
+      this.reusedSockets += 1;
+    } else {
+      this.newSockets += 1;
+    }
+
+    this.latencies.ingress_ms.push(ingressMs);
+    this.latencies.sanitize_ms.push(sanitizeMs);
+    this.latencies.queue_ms.push(queueMs);
+    this.latencies.dns_ms.push(dnsMs);
+    this.latencies.connect_ms.push(connectMs);
+    this.latencies.tls_ms.push(tlsMs);
+    this.latencies.handshake_total_ms.push(handshakeMs);
+    this.latencies.ttfb_ms.push(ttfbMs);
+    if (ttftMs > 0) {
+      this.latencies.ttft_ms.push(ttftMs);
+    }
+    this.latencies.total_ms.push(totalMs);
+
+    if (upstream) {
+      const up = this._getUpstreamCollector(upstream);
+      up.totalRequests += 1;
+      if (reusedSocket) {
+        up.reusedSockets += 1;
+      } else {
+        up.newSockets += 1;
+      }
+      up.ttfb_ms.push(ttfbMs);
+      if (ttftMs > 0) {
+        up.ttft_ms.push(ttftMs);
+      }
+      up.total_ms.push(totalMs);
+    }
+  }
+
+  reset() {
+    this.totalRequests = 0;
+    this.activeRequests = 0;
+    this.reusedSockets = 0;
+    this.newSockets = 0;
+    for (const win of Object.values(this.latencies)) {
+      win.reset();
+    }
+    this.byUpstream.clear();
+  }
+
+  snapshot() {
+    const totalSockets = this.reusedSockets + this.newSockets;
+    const reuseRatePct = totalSockets > 0
+      ? Number(((this.reusedSockets / totalSockets) * 100).toFixed(2))
+      : 0;
+
+    const latenciesSummary = {};
+    for (const [key, win] of Object.entries(this.latencies)) {
+      latenciesSummary[key] = win.summary();
+    }
+
+    const byUpstreamSummary = {};
+    for (const [key, up] of this.byUpstream.entries()) {
+      const upTotalSockets = up.reusedSockets + up.newSockets;
+      const upReusePct = upTotalSockets > 0
+        ? Number(((up.reusedSockets / upTotalSockets) * 100).toFixed(2))
+        : 0;
+      byUpstreamSummary[key] = {
+        total_requests: up.totalRequests,
+        reused_sockets: up.reusedSockets,
+        new_sockets: up.newSockets,
+        reuse_rate_pct: upReusePct,
+        ttfb_ms: up.ttfb_ms.summary(),
+        ttft_ms: up.ttft_ms.summary(),
+        total_ms: up.total_ms.summary(),
+      };
+    }
+
+    return {
+      total_requests: this.totalRequests,
+      active_requests: this.activeRequests,
+      socket_reuse: {
+        reused_count: this.reusedSockets,
+        new_count: this.newSockets,
+        reuse_rate_pct: reuseRatePct,
+      },
+      latencies: latenciesSummary,
+      by_upstream: byUpstreamSummary,
+    };
+  }
+}
+
 function helperCommand(config) {
   if (process.env.CODEX_BRIDGE_HELPER_CMD) {
     let extra = [];
@@ -480,6 +736,16 @@ function hopByHopHeaders(headers) {
     "trailer",
     "transfer-encoding",
     "upgrade",
+    "x-codex-bridge-mode",
+  ]);
+  return Object.fromEntries(
+    Object.entries(headers).filter(([name]) => !excluded.has(name.toLowerCase())),
+  );
+}
+
+export function stripInternalHeaders(headers) {
+  const excluded = new Set([
+    "x-codex-bridge-mode",
   ]);
   return Object.fromEntries(
     Object.entries(headers).filter(([name]) => !excluded.has(name.toLowerCase())),
@@ -509,7 +775,7 @@ function isForeignEncryptedContent(value, targetProvider) {
   if (targetProvider === "gemini" || targetProvider === "claude") {
     return !isGeminiCarrier && !isAntigravityCompaction;
   }
-  return !isGeminiCarrier && !isAntigravityCompaction;
+  return true;
 }
 
 function containsForeignEncryptedContent(value, targetProvider) {
@@ -540,7 +806,7 @@ const GEMINI_RESPONSES_CARRIER_PREFIX = "cpa-gemini-responses-carrier-v1:";
 export function compactionProviderFamily(routeProvider) {
   if (routeProvider === "openai") return "openai";
   if (routeProvider === "gemini" || routeProvider === "claude") return "antigravity";
-  return null;
+  return "unsupported";
 }
 
 export function classifyCompactionCapsule(item) {
@@ -609,7 +875,7 @@ function removeIncompatibleCompactionItems(value, targetFamily) {
 export function inspectCompactionForRoute(payload, route) {
   const items = findCompactionItems(payload);
   const targetFamily = compactionProviderFamily(route?.provider);
-  if (items.length === 0 || !targetFamily) {
+  if (items.length === 0) {
     return { targetFamily, items: [], compatible: true, incompatible: [] };
   }
   const classified = items.map((item) => ({ item, capsule: classifyCompactionCapsule(item) }));
@@ -946,7 +1212,7 @@ function readJsonIfPresent(filePath) {
  * Never return or log credential contents, account emails, or validation URLs.
  */
 export function classifyAntigravityAuthUnavailable(status, bodyBuffer, authDir, model, now = Date.now()) {
-  if (status !== 503 || !/^gemini-/i.test(String(model || ""))) return null;
+  if (status !== 503 || !/^(?:gemini-|claude-)/i.test(String(model || ""))) return null;
   let upstream;
   try {
     upstream = JSON.parse(bodyBuffer.toString("utf8"));
@@ -1008,9 +1274,18 @@ export function classifyAntigravityAuthUnavailable(status, bodyBuffer, authDir, 
 
 function forwardWithPoolFailureGuard(upstream, response, route, context, config, log) {
   const status = upstream.statusCode || 502;
-  if (route.provider !== "gemini" || status !== 503 ||
+  const isAntigravity = route.provider === "gemini" || route.provider === "claude";
+  if (!isAntigravity || status !== 503 ||
       upstream.headers["content-encoding"] ||
       !String(upstream.headers["content-type"] || "").includes("application/json")) {
+    upstream.on("error", (error) => {
+      log(`${formatRouterLog(context, "upstream_response_error")} cause=${safeId(error?.code || "stream_error")}`);
+      if (!response.headersSent) {
+        responseJson(response, 502, publicError(error, context));
+      } else {
+        response.destroy();
+      }
+    });
     response.writeHead(status, upstream.headers);
     upstream.pipe(response);
     return;
@@ -1039,11 +1314,12 @@ function forwardWithPoolFailureGuard(upstream, response, route, context, config,
     log(`${formatRouterLog(context, "antigravity_pool_action_required")} validation=${pool.validation} quota=${pool.quota}`);
     // Codex 0.155.0-alpha retries 403/409/422/424 stream failures six times;
     // a model-scoped 400 with an explicit code terminates after one request.
+    const providerLabel = route.provider === "claude" ? "Claude" : "Gemini";
     responseJson(response, 400, {
       error: {
         type: "upstream_account_action_required",
         code: "antigravity_account_action_required",
-        message: `No eligible Antigravity account for this Gemini model. ${pool.quota > 0
+        message: `No eligible Antigravity account for this ${providerLabel} model. ${pool.quota > 0
           ? "Google account verification is required for some accounts; the remaining accounts are in quota cooldown."
           : "Google account verification is required for every enabled account."} Repeating OAuth login or this request will not resolve it. Verify the affected Google accounts, or explicitly choose another model in a new task with a plain-text summary. The router will not switch providers silently.`,
       },
@@ -1081,6 +1357,7 @@ function requestModule(target) {
 export function createRouterServer(options = {}) {
   const config = { ...createConfig(), ...options.config };
   const log = options.log || ((line) => process.stderr.write(`${line}\n`));
+  const metricsCollector = options.metricsCollector || new MetricsCollector();
   const providerStateBySession = new Map();
   const requestImpl = options.requestImpl || ((target, requestOptions, callback) => {
     return requestModule(target).request(target, requestOptions, callback);
@@ -1134,6 +1411,17 @@ export function createRouterServer(options = {}) {
       return;
     }
 
+    if (request.url === "/__codex_bridge_metrics" || request.url?.startsWith("/__codex_bridge_metrics?")) {
+      const urlObj = new URL(request.url, "http://127.0.0.1");
+      if (urlObj.searchParams.get("reset") === "1") {
+        metricsCollector.reset();
+        responseJson(response, 200, { status: "reset", message: "Metrics reset successfully" });
+        return;
+      }
+      responseJson(response, 200, metricsCollector.snapshot());
+      return;
+    }
+
     if (request.url.startsWith("/__sse_shim/")) {
       const rawTarget = request.url.slice("/__sse_shim/".length);
       let targetUrl;
@@ -1183,13 +1471,20 @@ export function createRouterServer(options = {}) {
       return;
     }
 
+    const tIncoming = performance.now();
+    const tracker = metricsCollector.startRequest(tIncoming);
+
     let body;
     try {
       body = await collectBody(request);
     } catch (error) {
+      tracker.cancel();
       responseJson(response, 400, { error: "request_body_unreadable", cause: error.message });
       return;
     }
+
+    const tParsed = performance.now();
+    const ingressMs = Math.max(0, tParsed - tIncoming);
 
     const model = extractModel(request.headers, body);
     const route = resolveRoute(model);
@@ -1197,6 +1492,7 @@ export function createRouterServer(options = {}) {
     log(formatRouterLog(context));
 
     if (!route) {
+      tracker.cancel();
       responseJson(response, 400, {
         error: "model_route_not_found",
         message: "Model is required and must match an explicit router route",
@@ -1226,18 +1522,22 @@ export function createRouterServer(options = {}) {
       target = upstreamTarget(route, config, request.url);
       headers = headersForRoute(route, request, config, target);
     } catch (error) {
+      tracker.cancel();
       log(formatRouterLog(context, "route_error"));
       responseJson(response, 502, publicError(error, context));
       return;
     }
 
     const state = previousProviderFor(context);
+    const tSanitizeStart = performance.now();
     const prepared = sanitizeBodyForRoute(body, request.headers, route, {
       providerSwitchCompactionMode: config.providerSwitchCompactionMode,
       providerSwitchStateMode: config.providerSwitchStateMode,
       previousProvider: state.provider,
     });
+    const sanitizeMs = Math.max(0, performance.now() - tSanitizeStart);
     if (prepared.providerSwitchGuard?.action === "blocked") {
+      tracker.cancel();
       log(`${formatRouterLog(context, "provider_switch_state_blocked")} source_provider=${safeId(prepared.providerSwitchGuard.sourceProvider)} target_provider=${safeId(prepared.providerSwitchGuard.targetProvider)} reasons=${safeId(prepared.providerSwitchGuard.reasons.join(","))}`);
       responseJson(response, 409, {
         error: "provider_switch_state_conflict",
@@ -1257,6 +1557,7 @@ export function createRouterServer(options = {}) {
       return;
     }
     if (prepared.compactionGuard?.action === "blocked") {
+      tracker.cancel();
       const formats = prepared.compactionGuard.incompatible
         .map((capsule) => capsule.format)
         .join(",");
@@ -1298,14 +1599,156 @@ export function createRouterServer(options = {}) {
       path: `${target.pathname}${target.search}`,
       headers,
     };
+
+    const tDispatch = performance.now();
+    let tSocketAssigned = null;
+    let tDns = null;
+    let tConnect = null;
+    let tSecureConnect = null;
+    let socketReused = false;
+    let queueMs = 0;
+    let dnsMs = 0;
+    let connectMs = 0;
+    let tlsMs = 0;
+
+    function onSocket(sock) {
+      if (!sock) return;
+      tSocketAssigned = performance.now();
+      queueMs = Math.max(0, tSocketAssigned - tDispatch);
+      if (upstreamRequest.reusedSocket || sock.connecting === false) {
+        socketReused = true;
+      }
+      sock.once("lookup", () => {
+        tDns = performance.now();
+        dnsMs = Math.max(0, tDns - (tSocketAssigned || tDispatch));
+      });
+      sock.once("connect", () => {
+        tConnect = performance.now();
+        connectMs = Math.max(0, tConnect - (tDns || tSocketAssigned || tDispatch));
+      });
+      sock.once("secureConnect", () => {
+        tSecureConnect = performance.now();
+        tlsMs = Math.max(0, tSecureConnect - (tConnect || tSocketAssigned || tDispatch));
+      });
+    }
+
+    const tokenRegex = /"(?:content|text|delta|reasoning_content|thought)"\s*:\s*"([^"\\]|\\.)+/;
+
     const upstreamRequest = requestImpl(target, requestOptions, (upstreamResponse) => {
       if (upstreamResponse.statusCode === 429 && (route.provider === "gemini" || route.provider === "claude")) {
         scheduleFastRebalanceOnQuota(log);
       }
+
+      let ttfbMs = 0;
+      let ttftMs = 0;
+      let tFirstByte = null;
+      let tFirstToken = null;
+      let tokenDetected = false;
+
+      function inspectToken(chunk) {
+        if (tokenDetected || !chunk) return;
+        try {
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          const sample = buf.length > 1024 ? buf.subarray(0, 1024).toString("utf8") : buf.toString("utf8");
+          const match = tokenRegex.exec(sample);
+          if (match && match[1]) {
+            tokenDetected = true;
+            tFirstToken = performance.now();
+            ttftMs = Math.max(0, tFirstToken - tDispatch);
+          }
+        } catch {
+          // ignore chunk decoding errors
+        }
+      }
+
+      function onChunk(chunk) {
+        if (!chunk) return;
+        if (!tFirstByte) {
+          tFirstByte = performance.now();
+          ttfbMs = Math.max(0, tFirstByte - tDispatch);
+        }
+        if (!tokenDetected) {
+          inspectToken(chunk);
+        }
+      }
+
+      const origWrite = response.write.bind(response);
+      const origEnd = response.end.bind(response);
+      response.write = function (chunk, ...args) {
+        onChunk(chunk);
+        return origWrite(chunk, ...args);
+      };
+      response.end = function (chunk, ...args) {
+        if (chunk) onChunk(chunk);
+        return origEnd(chunk, ...args);
+      };
+
+      function finalizeMetrics() {
+        if (tracker.completed) return;
+
+        if (upstreamRequest.reusedSocket) {
+          socketReused = true;
+        }
+        const tEnd = performance.now();
+        const totalMs = Math.max(0, tEnd - tIncoming);
+        if (!tFirstByte) {
+          ttfbMs = Math.max(0, tEnd - tDispatch);
+        }
+        const handshakeMs = dnsMs + connectMs + tlsMs;
+
+        tracker.finish({
+          upstream: route.upstream,
+          model: context.model,
+          reusedSocket: socketReused,
+          ingressMs,
+          sanitizeMs,
+          queueMs,
+          dnsMs,
+          connectMs,
+          tlsMs,
+          handshakeMs,
+          ttfbMs,
+          ttftMs,
+          totalMs,
+        });
+
+        log([
+          formatRouterLog(context, "request_perf"),
+          `reused=${socketReused}`,
+          `queue_ms=${queueMs.toFixed(1)}`,
+          `conn_ms=${(dnsMs + connectMs).toFixed(1)}`,
+          `tls_ms=${tlsMs.toFixed(1)}`,
+          `ttfb_ms=${ttfbMs.toFixed(1)}`,
+          `ttft_ms=${ttftMs.toFixed(1)}`,
+          `total_ms=${totalMs.toFixed(1)}`,
+          `status=${upstreamResponse.statusCode || 200}`,
+        ].join(" "));
+      }
+
+      response.once("finish", finalizeMetrics);
+      response.once("close", finalizeMetrics);
+
       forwardWithPoolFailureGuard(upstreamResponse, response, route, context, config, log);
     });
+
+    if (typeof upstreamRequest.on === "function") {
+      upstreamRequest.on("socket", onSocket);
+      if (upstreamRequest.socket) {
+        onSocket(upstreamRequest.socket);
+      }
+    }
+
     upstreamRequest.setTimeout(config.requestTimeoutMs, () => upstreamRequest.destroy(new Error("upstream_timeout")));
     upstreamRequest.on("error", (error) => {
+      tracker.finish({
+        upstream: route.upstream,
+        model: context.model,
+        reusedSocket: false,
+        ingressMs,
+        sanitizeMs,
+        queueMs,
+        totalMs: performance.now() - tIncoming,
+      });
       log(formatRouterLog(context, "upstream_error"));
       responseJson(response, 502, publicError(error, context));
     });
@@ -1316,6 +1759,7 @@ export function createRouterServer(options = {}) {
   const server = http.createServer((request, response) => {
     void handleRequest(request, response);
   });
+  server.metricsCollector = metricsCollector;
 
   server.on("upgrade", (request, socket, head) => {
     const model = parseRoutingHint(firstHeader(request.headers, ["x-codex-routing-hint"])) ||
@@ -1336,19 +1780,6 @@ export function createRouterServer(options = {}) {
       log(formatRouterLog(context, "antigravity_ws_disabled_for_prompt_rewrite"));
       socket.end("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n");
       return;
-    }
-    if (route.provider === "gemini" || route.provider === "claude") {
-      try {
-        void ensureAntigravityAuthReady(config.authDir, {
-          tokenEndpoint: options.tokenEndpoint,
-          clientId: options.clientId,
-          clientSecret: options.clientSecret,
-          leadMs: config.antigravityRefreshLeadMs,
-          log,
-        });
-      } catch (err) {
-        log(`[router] event=antigravity_preflight_upgrade_error error=${err?.message || err}`);
-      }
     }
     let target;
     try {

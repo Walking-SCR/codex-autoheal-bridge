@@ -73,6 +73,45 @@ def is_windows() -> bool:
     return os.name == "nt" or platform.system() == "Windows"
 
 
+def codex_cli_candidates(application_roots: tuple[Path, ...] | None = None) -> list[str]:
+    """Known CLI layouts, including Desktop bundles outside Terminal's PATH."""
+    candidates = [os.environ.get("CODEX_CLI_PATH"), shutil.which("codex")]
+    for root in application_roots if application_roots is not None else (
+        Path("/Applications"), Path.home() / "Applications"
+    ):
+        for app in ("ChatGPT.app", "Codex.app"):
+            resources = root / app / "Contents/Resources"
+            for suffix in (
+                "codex-cli/bin/codex",
+                "codex-cli/CodexCLI.app/Contents/MacOS/codex",
+                "codex",
+            ):
+                candidates.append(str(resources / suffix))
+    candidates.extend(("/opt/homebrew/bin/codex", "/usr/local/bin/codex"))
+    return list(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+
+def default_codex_cli(application_roots: tuple[Path, ...] | None = None) -> str:
+    """Discover an executable at call time; do not guess from an app version."""
+    for candidate in codex_cli_candidates(application_roots):
+        executable = shutil.which(os.path.expanduser(candidate))
+        if executable:
+            return str(Path(executable).absolute())
+    return "codex"
+
+
+def resolve_codex_cli(codex: str | None = None) -> str:
+    requested = codex if codex is not None else default_codex_cli()
+    executable = shutil.which(os.path.expanduser(requested))
+    if not executable:
+        raise FileNotFoundError(
+            f"Codex CLI is missing or not executable: {requested}. "
+            "Use --codex /absolute/path/to/codex or CODEX_CLI_PATH; "
+            "Desktop bundle layouts vary by installation."
+        )
+    return str(Path(executable).absolute())
+
+
 def python_executable() -> str:
     return sys.executable or shutil.which("python3") or shutil.which("python") or "python3"
 
@@ -395,6 +434,21 @@ def manifest_paths(selected: set[str] | None = None) -> list[Path]:
     return [path for path in paths if path.stem in selected]
 
 
+ROUTER_PATTERNS = (
+    re.compile(r"^(?:gpt-|codex-|o[134](?:-|$))", re.IGNORECASE),
+    re.compile(r"^gemini-", re.IGNORECASE),
+    re.compile(r"^deepseek-", re.IGNORECASE),
+    re.compile(r"^claude-", re.IGNORECASE),
+    re.compile(r"^glm-", re.IGNORECASE),
+    re.compile(r"^(?:minimax|qwen-|kimi-|moonshot-|doubao-|baichuan-|yi-|llama-|mistral-|grok-|zai-|custom-)", re.IGNORECASE),
+)
+
+
+def is_router_supported(model: str) -> bool:
+    normalized = model.strip()
+    return any(pattern.search(normalized) for pattern in ROUTER_PATTERNS)
+
+
 def validate_manifest(data: dict) -> list[str]:
     errors: list[str] = []
     required = {
@@ -417,6 +471,9 @@ def validate_manifest(data: dict) -> list[str]:
         errors.append(f"schema_version must be {SCHEMA_VERSION}")
     if isinstance(data.get("slug"), str) and not re.fullmatch(r"[a-zA-Z0-9._:-]+", data["slug"]):
         errors.append("slug contains unsupported characters")
+    slug = data.get("slug")
+    if isinstance(slug, str) and not is_router_supported(slug):
+        errors.append(f"slug '{slug}' does not match any route in 8318 router table")
     efforts = data.get("reasoning_efforts", [])
     allowed_efforts = {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
     if not efforts or any(not isinstance(item, str) or item not in allowed_efforts for item in efforts):
@@ -1341,9 +1398,9 @@ def cmd_audit(args: argparse.Namespace) -> None:
     proxy_version_text, proxy_version_tuple = proxy_version(Path(args.proxy_binary).expanduser())
     if proxy_version_tuple is None:
         findings.append("CLIProxyAPI version is unavailable")
-    elif "grok-4.6" in managed and proxy_version_tuple < MIN_TOOL_SAFE_PROXY_VERSION:
+    elif proxy_version_tuple < MIN_TOOL_SAFE_PROXY_VERSION:
         findings.append(
-            "CLIProxyAPI is older than 7.2.130; Grok Responses tool and multi-agent probes are required"
+            f"CLIProxyAPI is older than {'.'.join(str(p) for p in MIN_TOOL_SAFE_PROXY_VERSION)}; tool calling compatibility may be limited"
         )
     emit(
         {
@@ -1850,6 +1907,8 @@ def cmd_validate_manifest(args: argparse.Namespace) -> None:
 def cmd_add_model(args: argparse.Namespace) -> None:
     model_name = args.model.strip()
     slug = args.slug.strip() if getattr(args, "slug", None) else model_name.lower().replace("_", "-")
+    if not is_router_supported(slug):
+        slug = f"custom-{slug}"
     display_name = args.display_name.strip() if getattr(args, "display_name", None) else model_name
     raw_base_url = args.base_url.strip()
     api_key = args.api_key.strip()
@@ -1946,9 +2005,15 @@ def cmd_add_model(args: argparse.Namespace) -> None:
         alias: "{slug}"
 """
             if "openai-compatibility:" not in content:
-                content += "\nopenai-compatibility:\n" + new_block
+                content = content.rstrip() + "\n\nopenai-compatibility:\n" + new_block
             else:
-                content += "\n" + new_block
+                pattern = r"(?m)^(openai-compatibility:\s*\n)"
+                match = re.search(pattern, content)
+                if match:
+                    insert_pos = match.end()
+                    content = content[:insert_pos] + new_block + content[insert_pos:]
+                else:
+                    content = content.rstrip() + "\n" + new_block
             atomic_write(proxy_config_path, content, 0o600)
             result["proxy_config_updated"] = True
         else:
@@ -1962,7 +2027,7 @@ def cmd_add_model(args: argparse.Namespace) -> None:
 
         template = None
         for m in models_list:
-            if m.get("slug") == "deepseek-v4-flash":
+            if m.get("slug") in ("deepseek-flash", "deepseek-v4-flash"):
                 template = m
                 break
         if not template and models_list:
@@ -2265,7 +2330,7 @@ def parser() -> argparse.ArgumentParser:
     audit.add_argument("--auth-file", default=str(DEFAULT_AUTH_FILE))
     audit.add_argument("--proxy-config", default=str(DEFAULT_PROXY_CONFIG))
     audit.add_argument("--models-file")
-    audit.add_argument("--codex", default="codex")
+    audit.add_argument("--codex", default=default_codex_cli())
     audit.add_argument("--proxy-binary", default=str(DEFAULT_PROXY_BINARY))
     audit.add_argument("--platform", choices=["auto", "darwin", "windows", "mac", "win"], default="auto")
     audit.set_defaults(func=cmd_audit)
@@ -2348,7 +2413,7 @@ def parser() -> argparse.ArgumentParser:
         help="Require ordered successful pwd and git --version shell executions",
     )
     probe.add_argument("--timeout", type=int, default=180)
-    probe.add_argument("--codex", default="codex")
+    probe.add_argument("--codex", default=default_codex_cli())
     probe.set_defaults(func=cmd_probe)
 
     probe_multi_agent = sub.add_parser("probe-multi-agent")
@@ -2368,14 +2433,14 @@ def parser() -> argparse.ArgumentParser:
     add_m.add_argument("--display-name", help="Display name in Codex dropdown")
     add_m.add_argument("--slug", help="Model slug identifier (defaults to lowercase model)")
     add_m.add_argument("--provider-name", help="Provider block name in config.yaml")
-    add_m.add_argument("--catalog", default=str(DEFAULT_CODEX_HOME / "model-catalog-cli-proxy.bridge-test.json"))
+    add_m.add_argument("--catalog", default=str(DEFAULT_CODEX_HOME / "model-catalog-cli-proxy.json"))
     add_m.add_argument("--proxy-config", default=str(DEFAULT_PROXY_CONFIG))
     add_m.add_argument("--helper", default=str(DEFAULT_HELPER))
     add_m.add_argument("--apply", action="store_true")
     add_m.set_defaults(func=cmd_add_model)
 
     list_m = sub.add_parser("list-models")
-    list_m.add_argument("--catalog", default=str(DEFAULT_CODEX_HOME / "model-catalog-cli-proxy.bridge-test.json"))
+    list_m.add_argument("--catalog", default=str(DEFAULT_CODEX_HOME / "model-catalog-cli-proxy.json"))
     list_m.set_defaults(func=cmd_list_models)
 
     handoff = sub.add_parser("handoff", help="Generate a provider-neutral handoff from a Codex rollout")

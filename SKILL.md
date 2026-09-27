@@ -57,7 +57,7 @@ is unavailable, then binds the conversation to the fallback account.
 
 ### Antigravity quota-proximity priority rebalance
 
-Accounts in the Antigravity pool are dynamically prioritized by quota reset timing and tier capacity:
+Accounts in the Antigravity pool can be prioritized by quota reset timing and account tier:
 
 ```bash
 python3 <skill-dir>/scripts/antigravity_pool.py rebalance
@@ -354,7 +354,7 @@ Codex maps `fast` to the priority request value. Do not create `*-fast` as a cos
 After catalog sync, probe affected models:
 
 ```bash
-python3 <skill-dir>/scripts/bridge.py probe --models grok-4.6,deepseek-v4-pro
+python3 <skill-dir>/scripts/bridge.py probe --models <verified-model-a>,<verified-model-b>
 ```
 
 The probe runs `codex exec --profile cli-proxy` in ephemeral, read-only mode for each model and verifies a successful final response. Use `--fast` only for a model that advertises Fast. Keep prompts non-sensitive and do not persist sessions.
@@ -364,7 +364,7 @@ For the normal Desktop-transparent path, probe without switching Provider identi
 ```bash
 python3 <skill-dir>/scripts/bridge.py probe \
   --desktop \
-  --models grok-4.6,deepseek-v4-pro,deepseek-v4-flash,gpt-5.6-sol
+  --models <verified-third-party-model-a>,<verified-third-party-model-b>,<native-model>
 ```
 
 With `--desktop`, the probe reads the active root `model_catalog_json` from
@@ -378,7 +378,7 @@ When a model can chat but Codex reports an empty or incompatible Shell payload, 
 python3 <skill-dir>/scripts/bridge.py probe \
   --desktop \
   --shell \
-  --models grok-4.6
+  --models <verified-third-party-model>
 ```
 
 This passes only when Codex records a successful `pwd` command execution; a model that merely prints or simulates a path does not pass. If the failing custom model inherited `tool_mode = "code_mode_only"` from an OpenAI template, set `"tool_mode": null` in that model manifest and resync. Do not remove code mode from native OpenAI models globally.
@@ -462,5 +462,7 @@ Completion requires:
 - Fast represented and tested as a service tier when requested
 - a second sync with no changes
 - backups and rollback paths reported
+
+For Skill-only maintenance, validate instructions and changed scripts without mutating the live deployment.
 
 If Codex cannot complete a Responses request through a route, report it as unverified and do not advertise it as usable merely because `/v1/models` lists the name.
