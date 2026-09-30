@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path, { extname } from "node:path";
@@ -1810,7 +1810,9 @@ export function createRouterServer(options = {}) {
 }
 
 
+let catalogSyncInFlight = false;
 export function autoSyncCatalogOnStartup(log = () => {}) {
+  if (catalogSyncInFlight) return;
   try {
     const scriptPath = path.join(
       process.env.HOME || process.env.USERPROFILE || os.homedir(),
@@ -1822,31 +1824,46 @@ export function autoSyncCatalogOnStartup(log = () => {}) {
     );
     if (!fs.existsSync(scriptPath)) return;
     const pythonBin = process.env.CODEX_BRIDGE_PYTHON || process.env.PYTHON || "python3";
-    const out = execFileSync(pythonBin, [scriptPath], { encoding: "utf8", timeout: 8000 });
-    log(`[router] event=auto_sync_catalog result=${out.trim().replace(/\s+/g, " ")}`);
+    catalogSyncInFlight = true;
+    execFile(pythonBin, [scriptPath, "--apply"], { encoding: "utf8", timeout: 120000, maxBuffer: 65536 },
+      (error, stdout) => {
+        catalogSyncInFlight = false;
+        if (error) {
+          log(`[router] event=auto_sync_catalog_error type=${error.code || error.name || "unknown"} result=${stdout.trim().replace(/\s+/g, " ")}`);
+          return;
+        }
+        log(`[router] event=auto_sync_catalog result=${stdout.trim().replace(/\s+/g, " ")}`);
+      });
   } catch (err) {
+    catalogSyncInFlight = false;
     log(`[router] event=auto_sync_catalog_error error=${err?.message || err}`);
   }
 }
 
-export function watchNativeModelsCache(log = () => {}) {
+export function scheduleOfficialCatalogSync(log = () => {}) {
+  const timer = setInterval(() => autoSyncCatalogOnStartup(log), 6 * 60 * 60 * 1000);
+  if (timer.unref) timer.unref();
+  return timer;
+}
+
+export function watchOfficialCatalogInputs(log = () => {}) {
   try {
-    const nativeCache = path.join(
+    const codexHome = path.join(
       process.env.HOME || process.env.USERPROFILE || os.homedir(),
-      ".codex",
-      "models_cache.json"
+      ".codex"
     );
-    if (!fs.existsSync(nativeCache)) return;
+    if (!fs.existsSync(codexHome)) return;
     let debounceTimer = null;
-    fs.watch(nativeCache, (eventType) => {
+    fs.watch(codexHome, (eventType, filename) => {
+      if (filename !== "models_cache.json" && filename !== "auth.json") return;
       if (debounceTimer) clearTimeout(debounceTimer);
       debounceTimer = setTimeout(() => {
-        log(`[router] event=native_cache_changed event_type=${eventType}`);
+        log(`[router] event=official_catalog_input_changed file=${filename} event_type=${eventType}`);
         autoSyncCatalogOnStartup(log);
       }, 3000);
     });
   } catch (err) {
-    log(`[router] event=watch_native_cache_error error=${err?.message || err}`);
+    log(`[router] event=watch_official_catalog_inputs_error error=${err?.message || err}`);
   }
 }
 
@@ -1906,7 +1923,8 @@ export function startRouter(options = {}) {
     try {
       const logFn = options.log || ((msg) => process.stdout.write(`${msg}\n`));
       autoSyncCatalogOnStartup(logFn);
-      watchNativeModelsCache(logFn);
+      watchOfficialCatalogInputs(logFn);
+      scheduleOfficialCatalogSync(logFn);
       autoRebalanceAntigravityPool(logFn);
       startPeriodicAntigravityRebalance(config.antigravityRebalanceIntervalMs, logFn);
     } catch (_) {}

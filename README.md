@@ -290,6 +290,24 @@ model_catalog_json = "~/.codex/model-catalog-cli-proxy.json"
 
 ---
 
+### 🔄 官方 GPT 模型目录同步
+
+Desktop 透明模式下，8318 路由会在启动、Codex 原生模型缓存变化或账号切换时检查官方模型；无变化时每 6 小时兜底检查。连续遇到目录查询 403 或模型不可用时，实际请求按 6 → 12 → 24 小时退避，并把下一次检查时间保存在仅当前用户可读的本地状态文件中。路由器重启不会清除退避；缓存或账号变化会立即重新检查。
+
+同步器先读取当前 `config.toml` 指向的**实际启用目录**，从账号可见目录及 Codex 原生缓存发现候选模型。新条目必须具备可信运行时元数据，并通过临时目录中的只读 `codex exec` 请求，才会备份并原子写入模型选择器目录；失败不会移除现有 GPT 或第三方模型。公开发布或目录列名不等于当前账号可用，未知元数据的模型会标记为 `pending_metadata`，不会猜测能力后强行上架。已审阅的 `gpt-6.1-sol` 作为候选也须通过相同探测。
+
+```bash
+# 只读预览；不会写入目录或改变退避状态
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/auto_sync_official.py
+
+# 手动立即检查并在真实探测成功后应用（跳过退避）
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/auto_sync_official.py --apply --force
+```
+
+账号目录返回 403 时不将其解释为“账号没有该模型”；如果 Codex 探测也失败，同步器保持下拉框不变。成功写入后，桌面客户端可能需要新建任务或重新加载才能刷新下拉框。此同步只处理官方模型，不修改第三方条目；`bridge.py sync` 是独立的隔离 profile 目录工作流。
+
+---
+
 ### 🛠️ 故障排查（FAQ）
 
 | 报错信息                                     | 真实原因                                                   | 解决方式                                                                      |
@@ -422,6 +440,24 @@ This command automatically:
 5. Runs health preflight probes.
 
 Finally restart Codex Desktop (`Cmd + Q`).
+
+---
+
+### 🔄 Official GPT Catalog Sync
+
+In Desktop-transparent mode, the 8318 router checks for official models at startup and when the native Codex cache or signed-in account changes. An unchanged installation gets a six-hour fallback check. Repeated 403 or unavailable-model results back off actual requests to 6, 12, then 24 hours; a cache/account change bypasses that window. Retry state is stored owner-only and survives router restarts.
+
+The synchronizer resolves the **active** catalog from `config.toml`, discovers candidates from the account-visible list and native cache, and requires trustworthy runtime metadata plus a successful ephemeral, read-only `codex exec` turn before backing up and atomically updating the picker catalog. Existing GPT, manual, and third-party entries are preserved. Publication or a catalog listing alone does not prove account access; unknown metadata is reported as `pending_metadata`, never guessed into the picker. The reviewed `gpt-6.1-sol` candidate follows the same probe gate.
+
+```bash
+# Read-only preview
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/auto_sync_official.py
+
+# Immediate manual check; write only after a successful Codex probe
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/auto_sync_official.py --apply --force
+```
+
+A 403 account-catalog response is inconclusive; if the Codex probe fails, the picker stays unchanged. A successful catalog update may require a new Desktop task or reload to show the entry. This workflow does not change third-party entries; `bridge.py sync` separately handles the isolated profile catalog.
 
 ---
 

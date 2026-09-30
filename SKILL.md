@@ -275,7 +275,53 @@ The command does not rewrite `~/.codex/config.toml`. It preserves unrelated prof
 
 The helper is Python by default so Windows does not need Ruby. An existing `.rb` helper is left in place. Do not set or change the user's default model unless they explicitly ask. Do not overwrite built-in Provider IDs. After this profile exists, use `codex --profile cli-proxy`.
 
-### 4. Synchronize the profile model catalog
+### 4. Synchronize model catalogs
+
+For a missing **official** model in Desktop-transparent mode, use the active
+catalog synchronizer. It parses the root TOML's `model_catalog_json`; it does
+not assume the profile catalog is the Desktop catalog:
+
+```bash
+python3 <skill-dir>/scripts/auto_sync_official.py
+python3 <skill-dir>/scripts/auto_sync_official.py --apply
+python3 <skill-dir>/scripts/auto_sync_official.py --apply --force  # manual immediate check
+```
+
+The account-specific `https://api.openai.com/v1/models` list (only
+`visibility = "list"`) is the first discovery signal; Codex's
+`models_cache.json` is a second source of full runtime metadata. That cache
+can lag a release, while Codex app-server `model/list` can be bundled/cached.
+Neither a public model page nor a listed slug proves this ChatGPT account can
+run it. If the account endpoint returns 403 or is unavailable, do not erase
+entries or claim a negative entitlement result. A known exact slug can be
+bootstrapped explicitly with `--candidate <slug>` only when this Skill has
+reviewed metadata for it; `gpt-6.1-sol` uses the official low/medium/high/
+xhigh/max efforts and defaults to medium, not inherited `ultra`.
+
+Every new official entry must pass an ephemeral read-only `codex exec` turn
+against a private temporary catalog **before** the active catalog is atomically
+updated. Failed probes leave the picker unchanged. Unknown account-listed
+models without trustworthy runtime metadata are reported as
+`pending_metadata` rather than cloned speculatively. The script preserves
+unmanaged/third-party entries and unrelated config, detects a concurrent
+active-catalog change, and creates a `0600` backup. Its output never contains
+OAuth credentials or upstream error bodies.
+
+The deployed 8318 router calls this synchronizer on startup, when the native
+cache or account file changes, and every six hours without blocking inference.
+The synchronizer keeps only account/cache fingerprints and retry metadata in
+an owner-only state file; it never persists tokens. Unchanged sources within
+the retry window cause no network call or Codex probe. Consecutive 403/model
+failures back off to 6, 12, then 24 hours; a changed cache/account bypasses
+the window. `--force --apply` is for an explicit manual check. Source edits
+alone do not update a running router process; install a tested router version
+at a safe time, and do not restart it during a live third-party turn. A catalog
+write may also require a new Codex task or Desktop reload to refresh the
+picker. Report the Codex probe and UI observation separately.
+
+The following `bridge.py sync` command is for the isolated CLIProxyAPI
+**profile** catalog, not the active Desktop-transparent catalog. It verifies
+8317's live routes and is not a substitute for official-model discovery:
 
 Preview bundled models:
 
