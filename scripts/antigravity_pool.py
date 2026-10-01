@@ -170,6 +170,41 @@ def parse_iso_datetime(dt_str: str) -> datetime | None:
     return None
 
 
+def quota_percent(value: object) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            value = value.strip().removesuffix("%")
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return min(100.0, max(0.0, result))
+
+
+def snapshot_reset_seconds(snapshot: dict, window: str, now: datetime) -> float | None:
+    """Return live seconds to an absolute window reset, with legacy snapshot fallback."""
+    reset_at = snapshot.get(f"gemini{window}ResetAt")
+    reset_timestamp = None
+    if isinstance(reset_at, (int, float)) and not isinstance(reset_at, bool) and reset_at > 0:
+        reset_timestamp = float(reset_at) / 1000.0 if reset_at > 1e12 else float(reset_at)
+    elif isinstance(reset_at, str):
+        parsed = parse_iso_datetime(reset_at)
+        if parsed:
+            reset_timestamp = parsed.timestamp()
+    if reset_timestamp is not None:
+        return max(0.0, reset_timestamp - now.timestamp())
+
+    # Older plugin snapshots only contain a relative countdown. Age it from
+    # the snapshot timestamp rather than treating it as freshly measured.
+    reset_seconds = snapshot.get(f"gemini{window}ResetSeconds")
+    if isinstance(reset_seconds, (int, float)) and not isinstance(reset_seconds, bool) and reset_seconds >= 0:
+        captured_at = parse_iso_datetime(snapshot.get("updatedAt", ""))
+        base = captured_at.timestamp() if captured_at else now.timestamp()
+        return max(0.0, base + float(reset_seconds) - now.timestamp())
+    return None
+
+
 def fetch_account_tier(access_token: str, timeout: float = 2.0) -> str | None:
     if not access_token:
         return None
@@ -207,6 +242,12 @@ def calculate_account_priority(
     account_id = account.get("id", "")
     path = account.get("path")
     curr_priority = account.get("priority", 0)
+    raw_data = account.get("data", {})
+    snapshot = account.get("snapshot", {})
+    weekly_remaining = quota_percent(snapshot.get("gemini7dRemaining"))
+    five_hour_remaining = quota_percent(snapshot.get("gemini5hRemaining"))
+    weekly_reset_seconds = snapshot_reset_seconds(snapshot, "7d", now)
+    five_hour_reset_seconds = snapshot_reset_seconds(snapshot, "5h", now)
 
     is_disabled = bool(account.get("disabled", False))
     has_val_req = any(
@@ -223,6 +264,10 @@ def calculate_account_priority(
             "current_priority": curr_priority,
             "calculated_priority": 0,
             "time_to_reset_sec": None,
+            "weekly_time_to_reset_sec": weekly_reset_seconds,
+            "five_hour_time_to_reset_sec": five_hour_reset_seconds,
+            "weekly_remaining": weekly_remaining,
+            "five_hour_remaining": five_hour_remaining,
             "reset_str": "-",
             "reason": "disabled" if is_disabled else "validation_required",
         }
@@ -264,6 +309,10 @@ def calculate_account_priority(
             "current_priority": curr_priority,
             "calculated_priority": cooling_prio,
             "time_to_reset_sec": recover_in_sec,
+            "weekly_time_to_reset_sec": weekly_reset_seconds,
+            "five_hour_time_to_reset_sec": five_hour_reset_seconds,
+            "weekly_remaining": weekly_remaining,
+            "five_hour_remaining": five_hour_remaining,
             "reset_str": f"cools {recover_in_hours:.1f}h",
             "reason": f"cooling ({cooling_reason})",
         }
@@ -271,9 +320,41 @@ def calculate_account_priority(
     tier = account.get("tier") or "standard-tier"
     tier_weight = 150 if "standard" in str(tier).lower() or "pro" in str(tier).lower() else 40
 
-    raw_data = account.get("data", {})
-    snapshot = account.get("snapshot", {})
-    snap_reset_sec = snapshot.get("gemini5hResetSeconds")
+    if weekly_remaining == 0:
+        return {
+            "account": email or account_id,
+            "path": path,
+            "tier": tier,
+            "status": "WEEKLY_EXHAUSTED",
+            "current_priority": curr_priority,
+            "calculated_priority": 0,
+            "time_to_reset_sec": weekly_reset_seconds,
+            "weekly_time_to_reset_sec": weekly_reset_seconds,
+            "five_hour_time_to_reset_sec": five_hour_reset_seconds,
+            "weekly_remaining": weekly_remaining,
+            "five_hour_remaining": five_hour_remaining,
+            "reset_str": f"weekly resets in {weekly_reset_seconds / 3600:.1f}h" if weekly_reset_seconds is not None else "weekly exhausted",
+            "reason": "weekly quota exhausted",
+        }
+
+    if five_hour_remaining == 0:
+        hours_to_reset = five_hour_reset_seconds / 3600.0 if five_hour_reset_seconds is not None else None
+        return {
+            "account": email or account_id,
+            "path": path,
+            "tier": tier,
+            "status": "FIVE_HOUR_EXHAUSTED",
+            "current_priority": curr_priority,
+            "calculated_priority": 0,
+            "time_to_reset_sec": five_hour_reset_seconds,
+            "weekly_time_to_reset_sec": weekly_reset_seconds,
+            "five_hour_time_to_reset_sec": five_hour_reset_seconds,
+            "weekly_remaining": weekly_remaining,
+            "five_hour_remaining": five_hour_remaining,
+            "reset_str": f"5h resets in {hours_to_reset:.1f}h" if hours_to_reset is not None else "5h exhausted",
+            "reason": "5-hour quota exhausted; skip until reset",
+        }
+
     custom_reset = parse_iso_datetime(account.get("reset_timestamp") or raw_data.get("reset_timestamp"))
     if not custom_reset:
         for r in status_records:
@@ -288,8 +369,8 @@ def calculate_account_priority(
                             break
                 except Exception:
                     pass
-    if isinstance(snap_reset_sec, (int, float)) and snap_reset_sec > 0:
-        time_to_reset_sec = float(snap_reset_sec)
+    if five_hour_reset_seconds is not None:
+        time_to_reset_sec = five_hour_reset_seconds
     elif custom_reset and custom_reset > now:
         time_to_reset_sec = (custom_reset - now).total_seconds()
     else:
@@ -306,16 +387,19 @@ def calculate_account_priority(
 
     if hours_to_reset <= critical_window_hours:
         urgency = (critical_window_hours - hours_to_reset) / critical_window_hours
-        prio = int(800 + (urgency * 120) + (tier_weight / 3.0))
+        prio = int(500 + (urgency * 80) + (tier_weight / 10.0))
         status = "IMMINENT_RESET"
-        reset_str = f"in {hours_to_reset*60:.0f}m"
-        reason = "imminent reset (drain quota)"
+        reset_str = f"5h in {hours_to_reset*60:.0f}m"
+        reason = "5-hour reset imminent (secondary priority)"
     else:
-        time_factor = int(max(0, (24.0 - hours_to_reset) * 3))
-        prio = int(350 + tier_weight + time_factor)
+        prio = int(350 + (tier_weight / 10.0))
         status = "ACTIVE"
-        reset_str = f"in {hours_to_reset:.1f}h"
-        reason = f"active ({tier})"
+        reset_str = f"5h in {hours_to_reset:.1f}h"
+        reason = f"active ({tier}); weekly reset is the primary ranking key"
+
+    week_rank_hours = weekly_reset_seconds / 3600.0 if weekly_reset_seconds is not None else None
+    if weekly_remaining is not None and weekly_remaining > 0 and week_rank_hours is not None:
+        prio += int(max(0.0, 168.0 - week_rank_hours) / 168.0 * 200.0)
 
     return {
         "account": email or account_id,
@@ -325,6 +409,10 @@ def calculate_account_priority(
         "current_priority": curr_priority,
         "calculated_priority": prio,
         "time_to_reset_sec": time_to_reset_sec,
+        "weekly_time_to_reset_sec": weekly_reset_seconds,
+        "five_hour_time_to_reset_sec": time_to_reset_sec,
+        "weekly_remaining": weekly_remaining,
+        "five_hour_remaining": five_hour_remaining,
         "reset_str": reset_str,
         "reason": reason,
     }
@@ -399,30 +487,58 @@ def rebalance_antigravity_pool(
         )
         evaluated.append(item)
 
+    def status_rank(item: dict) -> int:
+        return {
+            "ACTIVE": 4,
+            "IMMINENT_RESET": 4,
+            "COOLING": 3,
+            "FIVE_HOUR_EXHAUSTED": 3,
+            "WEEKLY_EXHAUSTED": 2,
+            "BLOCKED": 1,
+        }.get(item["status"], 0)
+
+    def tier_rank(item: dict) -> int:
+        tier = str(item.get("tier", "")).casefold()
+        return 1 if "standard" in tier or "pro" in tier else 0
+
     def sort_key(item: dict):
-        status_rank = {"IMMINENT_RESET": 4, "ACTIVE": 3, "COOLING": 2, "BLOCKED": 1}.get(item["status"], 0)
-        return (status_rank, item["calculated_priority"])
+        rank = status_rank(item)
+        if rank == 4:
+            # Primary: earliest weekly reset. Secondary: an imminent 5h reset,
+            # then tier and configured priority for stable ties.
+            weekly = item.get("weekly_time_to_reset_sec")
+            weekly_key = float(weekly) if isinstance(weekly, (int, float)) else float("inf")
+            five = item.get("five_hour_time_to_reset_sec")
+            imminent_key = 0 if item["status"] == "IMMINENT_RESET" else 1
+            five_key = float(five) if imminent_key == 0 and isinstance(five, (int, float)) else float("inf")
+            return (-rank, weekly_key, imminent_key, five_key, -tier_rank(item), -int(item.get("current_priority", 0) or 0), str(item["account"]).casefold())
+        if rank == 3:
+            recovery = item.get("time_to_reset_sec")
+            recovery_key = float(recovery) if isinstance(recovery, (int, float)) else float("inf")
+            return (-rank, recovery_key, -tier_rank(item), str(item["account"]).casefold())
+        if rank == 2:
+            weekly = item.get("weekly_time_to_reset_sec")
+            weekly_key = float(weekly) if isinstance(weekly, (int, float)) else float("inf")
+            return (-rank, weekly_key, str(item["account"]).casefold())
+        return (-rank, str(item["account"]).casefold())
 
-    evaluated.sort(key=sort_key, reverse=True)
+    evaluated.sort(key=sort_key)
 
-    imminent_count = 0
-    active_count = 0
-    cooling_count = 0
-
+    available_index = 0
+    skipped_index = 0
     for item in evaluated:
-        st = item["status"]
-        if st == "IMMINENT_RESET":
-            item["target_priority"] = max(700, 900 - (imminent_count * 30))
-            imminent_count += 1
-        elif st == "ACTIVE":
-            tier_bonus = 50 if "standard" in str(item["tier"]).lower() or "pro" in str(item["tier"]).lower() else 0
-            item["target_priority"] = max(300, 600 + tier_bonus - (active_count * 50))
-            active_count += 1
-        elif st == "COOLING":
-            item["target_priority"] = max(20, 200 - (cooling_count * 20))
-            cooling_count += 1
+        status = item["status"]
+        if status in ("ACTIVE", "IMMINENT_RESET"):
+            item["target_priority"] = max(300, 900 - available_index * 10)
+            available_index += 1
+        elif status in ("COOLING", "FIVE_HOUR_EXHAUSTED"):
+            item["target_priority"] = max(20, 200 - skipped_index * 10)
+            skipped_index += 1
+        elif status == "WEEKLY_EXHAUSTED":
+            item["target_priority"] = 10
         else:
             item["target_priority"] = 0
+        item["calculated_priority"] = item["target_priority"]
 
     return evaluated
 
@@ -498,9 +614,11 @@ def cmd_rebalance(args: argparse.Namespace) -> int:
 
     # Export pool-status.json for usage header plugin & UI integration
     status_file = auth_dir / "pool-status.json"
-    primary_acct = evaluated[0]["account"] if evaluated else None
+    primary_item = next((item for item in evaluated if item["status"] in ("ACTIVE", "IMMINENT_RESET")), None)
+    primary_acct = primary_item["account"] if primary_item else None
+    status_now = datetime.now(timezone.utc)
     status_payload = {
-        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "updatedAt": status_now.isoformat(),
         "mode": "auto",
         "primaryAccount": primary_acct,
         "rankings": [
@@ -511,6 +629,12 @@ def cmd_rebalance(args: argparse.Namespace) -> int:
                 "tier": item["tier"],
                 "reset": item["reset_str"],
                 "reason": item["reason"],
+                "next_retry_after": (
+                    (status_now + timedelta(seconds=item["time_to_reset_sec"])).isoformat()
+                    if item["status"] in ("COOLING", "FIVE_HOUR_EXHAUSTED", "WEEKLY_EXHAUSTED")
+                    and isinstance(item.get("time_to_reset_sec"), (int, float))
+                    else None
+                ),
             }
             for item in evaluated
         ],
@@ -996,19 +1120,33 @@ def cmd_validation_fix(args: argparse.Namespace) -> int:
 
     # 重启 CLIProxyAPI 以清空内存冷却状态
     if args.restart:
-        label = args.launchd_label or find_launchd_cliproxy_label()
-        if label:
+        if sys.platform == "darwin":
+            label = args.launchd_label or find_launchd_cliproxy_label()
+            if label:
+                try:
+                    subprocess.run(
+                        ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
+                        check=True,
+                        timeout=15,
+                    )
+                    print(f"CLIProxyAPI restarted via launchd: {label}")
+                except (OSError, subprocess.SubprocessError) as err:
+                    print(f"warning: launchd 重启失败（{err}）；请手动重启 CLIProxyAPI 后重新探测", file=sys.stderr)
+            else:
+                print("warning: 未探测到 launchd 服务；请手动重启 CLIProxyAPI 后重新探测", file=sys.stderr)
+        elif os.name == "nt" or sys.platform == "win32":
             try:
-                subprocess.run(
-                    ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
-                    check=True,
-                    timeout=15,
-                )
-                print(f"CLIProxyAPI restarted via launchd: {label}")
+                subprocess.run(["taskkill", "/F", "/IM", "cliproxyapi.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                proxy_bin = shutil.which("cliproxyapi.exe") or shutil.which("cliproxyapi")
+                if proxy_bin:
+                    subprocess.Popen([proxy_bin], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    print(f"CLIProxyAPI restarted on Windows: {proxy_bin}")
+                else:
+                    print("CLIProxyAPI stopped on Windows; please restart process if needed")
             except (OSError, subprocess.SubprocessError) as err:
-                print(f"warning: launchd 重启失败（{err}）；请手动重启 CLIProxyAPI 后重新探测", file=sys.stderr)
+                print(f"warning: Windows 重启失败（{err}）；请手动重启 CLIProxyAPI", file=sys.stderr)
         else:
-            print("warning: 未探测到 launchd 服务；请手动重启 CLIProxyAPI 后重新探测", file=sys.stderr)
+            print("warning: 请手动重启 CLIProxyAPI 后重新探测", file=sys.stderr)
 
     # 探测验证恢复情况
     model = args.model or "gemini-3.8-flash-high"

@@ -1,11 +1,11 @@
 ---
 name: codex-autoheal-bridge
-description: Install, audit, repair, and manage Codex multi-model coexistence with model-aware routing and OAuth token self-healing. Routes official GPT models directly to OpenAI Native and third-party models (Gemini, Claude, DeepSeek) to loopback CLIProxyAPI (127.0.0.1:8317). Automatically self-heals expired Antigravity OAuth tokens across Mac sleep/wake cycles.
+description: Install, audit, repair, and manage Codex multi-model coexistence with model-aware routing and OAuth token self-healing across macOS and Windows. Routes official GPT models directly to OpenAI Native and third-party models (Gemini, Claude, DeepSeek) to loopback CLIProxyAPI (127.0.0.1:8317). Automatically self-heals expired Antigravity OAuth tokens across sleep/wake cycles.
 ---
 
 # Codex Autoheal Bridge (自愈型多模型桥)
 
-Manage subscription-backed or local proxy models in Codex Desktop and CLI with robust model-aware isolation and automatic OAuth token renewal.
+Manage subscription-backed or local proxy models in Codex Desktop and CLI with robust model-aware isolation and automatic OAuth token renewal across macOS and Windows.
 
 Codex selects one `model_provider` for a task. Model catalog entries do not carry per-model Provider routing. Preserve the Provider identity that owns the majority of indexed task history (normally `openai`). For normal Desktop use, the v2 bridge design keeps `model_provider = "openai"`, keeps ChatGPT subscription auth intact, and points the built-in Provider's `openai_base_url` at `http://127.0.0.1:8318/v1` (`codex-model-router.mjs`).
 
@@ -25,14 +25,99 @@ Codex Desktop
 
 ### Key v2 Improvements
 
-1. **Model-Aware Isolation**:
-   Official GPT models (`gpt-*`, `codex-*`, `o1/3/4`) are forwarded directly to OpenAI Native servers. They never transit CLIProxyAPI, preventing third-party gateway downtime from affecting official models.
+1. **Model-Aware Isolation & Dual-Plane Architecture**:
+   Official GPT models (`gpt-*`, `codex-*`, `o1/3/4`) are forwarded directly to OpenAI Native servers. They never transit CLIProxyAPI, preventing third-party gateway downtime from affecting official models. Control plane (`quota_failover.py` & `bridge.py`) manages rate-limit monitoring, catalog synthesis, and atomic config transitions without touching UI code or state databases.
 
-2. **On-Demand OAuth Token Self-Healing**:
-   Mac sleep, hibernation, or weekend shutdown will cause Google OAuth access tokens (1-hour TTL) to expire. 8318 Router intercepts expired credentials, silently uses the long-lived `refresh_token` to fetch a fresh token from Google within 300ms, and pauses to allow 8317 to reload—completely eliminating `503 auth_unavailable` errors.
+2. **Simultaneous Multi-Model Coexistence in External Mode**:
+   When entering external mode, the generated catalog simultaneously presents all third-party models (`Visible Catalog ⊆ 8318 可路由模型 ∩ 8317 实际存在模型`), including Gemini (3.8 Flash, 3.1 Pro, 3.7 Flash, 2.5 Pro), Claude Sonnet 4.6, DeepSeek (V4 Pro, Flash), GLM (5.3 Flash, 5.2), and MiniMax-M3 in the Codex model picker. Users can freely switch models in the UI dropdown without triggering routing conflicts.
 
-3. **Legacy Transparent Proxy Deprecation**:
+3. **Explicit Header Contract & Dynamic Compaction**:
+   External provider configuration routes through `http://127.0.0.1:8318/v1` with `x-codex-bridge-mode = "external"`. The 8318 router intercepts this header, dynamically enables `drop_foreign` compaction mode across model switches (dropping foreign carrier tokens and previous response IDs while preserving conversation history), fast-fails any direct GPT calls with HTTP 409, and strips internal headers before forwarding upstream to 8317.
+
+4. **4-State Lifecycle Machine & Safe Quota Failover**:
+   Transitions follow `OPENAI_ACTIVE` -> `EXTERNAL_RESTART_REQUIRED` -> `EXTERNAL_ACTIVE` -> `OPENAI_RESTORE_PENDING` -> `OPENAI_ACTIVE`. Fails over immediately on 100% window exhaustion or spend limits, and restores only when fresh backend confirmation confirms complete recovery. Active external model turns are never killed during restore.
+
+5. **On-Demand OAuth Token Self-Healing**:
+   Sleep, hibernation, or weekend shutdown will cause Google OAuth access tokens (1-hour TTL) to expire. 8318 Router intercepts expired credentials, silently uses the long-lived `refresh_token` to fetch a fresh token from Google within 300ms, and pauses to allow 8317 to reload—completely eliminating `503 auth_unavailable` errors.
+
+6. **Full Windows Native Support & Zero-Console-Window Daemon**:
+   Fully adapts to Windows 10/11 with zero-console-window hidden VBS runner (`run-router-hidden.vbs`), automatic user logon startup registration (`%APPDATA%\...\Startup`), native process discovery via `tasklist`, and Windows-friendly PowerShell/Batch helpers (`setup_windows.cmd`, `toggle_mode.cmd`). See [references/windows.md](references/windows.md).
+
+7. **Legacy Transparent Proxy Deprecation**:
    The legacy `transparent_proxy.mjs` (which blindly forwarded all models to 8317) and its LaunchAgent `com.zhijian.codex-cli-model-bridge-transparent-proxy` are permanently superseded by `codex-model-router.mjs` and `com.zhijian.codex-cli-model-bridge-router`.
+
+### Codex included-usage exhaustion / disabled Send
+
+When ChatGPT/Codex included usage is exhausted and Desktop disables Send before
+the local router receives any request, read
+[references/quota-failover.md](references/quota-failover.md). This is separate
+from Antigravity OAuth, Google validation, and third-party quota failures.
+
+Start with `scripts/quota_failover.py quota-status --live`. It discovers the CLI
+from `CODEX_CLI_PATH`, PATH, current/legacy ChatGPT.app and Codex.app layouts
+(system and user Applications), then common Homebrew locations. Never assume
+an app version implies one fixed CLI path. Use `--codex` for an explicit verified
+executable; tests use `bridge.tomllib` so Python <3.11 follows the existing
+`tomli` fallback.
+
+External Mode is an opt-in workaround, not automatic permission to switch
+Provider. Preview `external-mode` first; it writes no state, catalog, config,
+or LaunchAgent. A default-Provider switch can hide existing OpenAI tasks in
+the UI. Explain this and obtain explicit acceptance before `--apply`; also
+obtain approval before restarting the desktop app or installing the watcher.
+This is a temporary, user-approved exception to the normal dominant-history
+Provider invariant. Preserve task rows, ChatGPT auth, and unrelated TOML.
+
+For manual quick toggling between OpenAI mode and External mode in a single command:
+
+```bash
+# Every execution alternates between OpenAI and External mode:
+python3 <skill-dir>/scripts/quota_failover.py toggle --apply --restart
+```
+
+For explicit two-way automation, use `auto-mode --model <verified-external-model>`
+to preview, then `--apply` only after the user approves background monitoring,
+the fixed fallback model, and the history-scope tradeoff. It monitors GPT in
+normal mode, enters External Mode only on fresh `ordinaryUsageAllowed=false`,
+restores after backend-confirmed recovery, and keeps monitoring for later
+cycles. Use `stop-auto` to preview disabling and `stop-auto --apply` to stop
+without changing the current mode. Do not migrate existing tasks or switch
+their model automatically; the change is to the default routing configuration.
+
+The one-way return watcher and the two-way monitor restore saved fields only after a fresh
+backend response confirms `ordinaryUsageAllowed=true` and no blocking windows,
+individual limit, or spend control. Missing fields, query errors, stale cached
+data, or a passed reset time do not confirm recovery. They refuse restoration
+if the user has changed those routing fields, and never restart an active app.
+CLI query success does not prove that this Desktop version's Send button is
+fixed: require a real external-model Codex probe and a user/UI check before
+claiming the workaround is usable. Updating this Skill alone must not activate
+External Mode, deploy a watcher, or restart services.
+
+### Windows Native Workflows & Quick Start
+
+Windows 10/11 is fully supported out of the box with zero console window popups.
+For complete details and troubleshooting, see [references/windows.md](references/windows.md).
+
+#### 1. Instant Automated Setup on Windows
+- **Option A (Double-click)**: Run `scripts\setup_windows.cmd` directly from File Explorer.
+- **Option B (PowerShell)**:
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File .\scripts\setup_windows.ps1
+  ```
+- **Option C (Standard CLI)**:
+  ```cmd
+  python scripts\bridge.py configure-desktop --platform windows --apply
+  python scripts\bridge.py sync --apply
+  ```
+The setup generates a hidden VBS runner (`run-router-hidden.vbs`) and registers `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\codex-model-router.vbs`, running the 8318 gateway completely invisibly at user logon.
+
+#### 2. Fast Dual-Mode Toggle on Windows (OpenAI ↔ External)
+- **Option A (Double-click)**: Double-click `scripts\toggle_mode.cmd`.
+- **Option B (Command line)**:
+  ```cmd
+  python scripts\quota_failover.py toggle --apply --restart
+  ```
 
 ### Antigravity multi-account quota failover
 
@@ -64,10 +149,15 @@ python3 <skill-dir>/scripts/antigravity_pool.py rebalance
 python3 <skill-dir>/scripts/antigravity_pool.py rebalance --apply
 ```
 
-1. **Primary criterion (Proximity to Reset)**: Accounts whose quota resets soonest are prioritized. Accounts within an imminent reset window (default: <= 2 hours) receive high-tier priority (800~999) to drain remaining capacity before window expiration and avoid quota waste.
-2. **Secondary criterion (Remaining Quota & Tier)**: In normal active windows, Pro tier accounts (`standard-tier` / `g1-pro-tier`) are prioritized over Free tier accounts (`free-tier`).
-3. **Cooling & Blocked Handling**: Accounts in 429 cooldown receive low cooling priority (100~200) ranked by earliest recovery time so they automatically step in upon cooldown expiration. Blocked or `VALIDATION_REQUIRED` accounts receive priority 0.
-4. **Automated Scheduling**: The 8318 Router runs rebalancing on startup, periodically every 15 minutes, and reactively debounced upon receiving an upstream 429 quota exhaustion signal.
+1. **Primary criterion — weekly reset**: Among accounts with remaining 7-day quota, the account with the least time until its weekly reset ranks first. The weekly reset time is the primary sort key; it always takes precedence over 5-hour urgency and tier.
+2. **Secondary criterion — 5-hour reset**: When accounts have equal weekly reset times—or all compared weekly reset times are unknown—a usable account whose 5-hour window resets within the imminent window (default: <= 2 hours) ranks ahead, so expiring short-window capacity is used. Tier (`standard-tier` / `g1-pro-tier`) and existing priority are later tie-breakers only.
+3. **Exhausted and blocked handling**: An account with 0% 5-hour remaining is marked `FIVE_HOUR_EXHAUSTED` and assigned a lower priority than every usable account, even if its weekly quota remains; new `fill-first` selections therefore move to the next usable account. An account with 0% weekly remaining is `WEEKLY_EXHAUSTED`. Both remain behind usable accounts and carry their reset time when available. 429 cooldown follows these unavailable quota windows by earliest recovery; disabled or `VALIDATION_REQUIRED` accounts are `BLOCKED` with priority 0.
+4. **Applied priority ranges**: usable accounts receive descending priorities from 900; 5-hour exhausted and 429-cooling accounts from 200; weekly-exhausted accounts receive 10; blocked accounts receive 0. The generated `pool-status.json` names a primary only when a usable account exists.
+5. **Automated Scheduling**: The 8318 Router runs rebalancing on startup, periodically every 15 minutes, and reactively debounced upon receiving an upstream 429 quota exhaustion signal. The plugin's “重排” button invokes the same `rebalance --apply` operation manually.
+
+Quota inputs come from the plugin's local `quota-snapshot.json` (`gemini5hRemaining` / `gemini7dRemaining` and absolute reset timestamps). Older snapshots containing only relative countdowns remain supported by aging the countdown from `updatedAt`. A missing weekly reset time sorts after accounts with known weekly reset times; when weekly times are equally unknown, use the 5-hour tie-breaker. Without a 5-hour remaining value, do not infer exhaustion.
+
+With CLIProxyAPI `session-affinity` enabled, priority changes select the next eligible account for new or unbound requests. An already-bound conversation remains sticky until CLIProxyAPI observes that credential as cooling/unavailable; rebalancing does not forcibly clear live session affinity.
 
 When Google returns `403 VALIDATION_REQUIRED`, follow
 [references/antigravity-validation.md](references/antigravity-validation.md).
@@ -237,7 +327,11 @@ The audit must redact secrets and verify:
 
 Codex officially supports only the Responses wire API for custom Providers. Do not register a Chat Completions-only route and call it Codex-compatible.
 
-If the default Provider differs from the dominant indexed-history Provider, treat history restoration as the first repair. Do not edit task rows to make the current Provider fit.
+If the default Provider differs from the dominant indexed-history Provider,
+treat history restoration as the first repair unless the quota-failover state
+records a currently authorized temporary External Mode. Do not undo that
+exception merely because an audit sees a minority Provider, and never edit
+task rows to make the current Provider fit.
 
 ### 2. Restore the desktop default and history
 
@@ -400,7 +494,7 @@ Codex maps `fast` to the priority request value. Do not create `*-fast` as a cos
 After catalog sync, probe affected models:
 
 ```bash
-python3 <skill-dir>/scripts/bridge.py probe --models <verified-model-a>,<verified-model-b>
+python3 <skill-dir>/scripts/bridge.py probe --models claude-sonnet-4-6,deepseek-v4-pro
 ```
 
 The probe runs `codex exec --profile cli-proxy` in ephemeral, read-only mode for each model and verifies a successful final response. Use `--fast` only for a model that advertises Fast. Keep prompts non-sensitive and do not persist sessions.
@@ -410,7 +504,7 @@ For the normal Desktop-transparent path, probe without switching Provider identi
 ```bash
 python3 <skill-dir>/scripts/bridge.py probe \
   --desktop \
-  --models <verified-third-party-model-a>,<verified-third-party-model-b>,<native-model>
+  --models claude-sonnet-4-6,deepseek-v4-pro,deepseek-flash,gpt-5.6-sol
 ```
 
 With `--desktop`, the probe reads the active root `model_catalog_json` from
@@ -424,7 +518,7 @@ When a model can chat but Codex reports an empty or incompatible Shell payload, 
 python3 <skill-dir>/scripts/bridge.py probe \
   --desktop \
   --shell \
-  --models <verified-third-party-model>
+  --models claude-sonnet-4-6
 ```
 
 This passes only when Codex records a successful `pwd` command execution; a model that merely prints or simulates a path does not pass. If the failing custom model inherited `tool_mode = "code_mode_only"` from an OpenAI template, set `"tool_mode": null` in that model manifest and resync. Do not remove code mode from native OpenAI models globally.
@@ -490,7 +584,7 @@ Read [troubleshooting.md](references/troubleshooting.md) for failure classificat
 - Use command-backed auth or the owner-only transparent header rewriter; do not embed `experimental_bearer_token` or duplicate the proxy client key.
 - Treat native `models_cache.json` as upstream input, not a file this Skill owns.
 - Do not directly edit Codex SQLite state or the desktop app bundle to force a model into the picker.
-- Never switch the default Provider without first reading the indexed Provider distribution. Refuse a switch that would hide the majority of history unless the user explicitly accepts that result.
+- Never switch the default Provider without first reading the indexed Provider distribution. Refuse a switch that would hide the majority of history unless the user explicitly accepts that result; use the quota-failover runbook for a temporary accepted exception.
 - Do not advertise per-model Provider routing. Desktop coexistence works only because the built-in `openai` Provider identity transparently routes every selected catalog model through the same loopback bridge.
 - Respect Provider subscription terms, quotas, and account ownership.
 
@@ -509,6 +603,9 @@ Completion requires:
 - a second sync with no changes
 - backups and rollback paths reported
 
-For Skill-only maintenance, validate instructions and changed scripts without mutating the live deployment.
+For an explicitly authorized quota External Mode, use the focused completion
+gate in `references/quota-failover.md` instead of immediately forcing the
+dominant Provider back. For Skill-only maintenance, validate instructions and
+changed scripts/tests without mutating the live deployment.
 
 If Codex cannot complete a Responses request through a route, report it as unverified and do not advertise it as usable merely because `/v1/models` lists the name.

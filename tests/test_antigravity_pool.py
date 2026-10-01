@@ -243,6 +243,80 @@ class AntigravityPoolTests(unittest.TestCase):
             # Pro tier gets higher priority than Free tier when reset time is identical
             self.assertGreater(by_email["pro@example.com"]["target_priority"], by_email["free@example.com"]["target_priority"])
 
+    def test_weekly_reset_is_primary_five_hour_imminence_is_secondary_and_empty_5h_is_skipped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(f"auth-dir: {root}\n")
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+
+            accounts = {
+                "weekly-first@example.test": (3 * 86400, 50, 10 * 3600),
+                # Weekly reset is later; its imminent 5h reset must not leapfrog the weekly primary key.
+                "weekly-second@example.test": (5 * 86400, 80, 10 * 60),
+                # Equal weekly window: the imminent 5h reset is the secondary key.
+                "short-imminent@example.test": (2 * 86400, 45, 10 * 60),
+                "short-later@example.test": (2 * 86400, 70, 90 * 60),
+                # Even with the soonest 7d reset, a 0% 5h account must be skipped.
+                "five-hour-empty@example.test": (86400, 0, 2 * 3600),
+                "weekly-empty@example.test": (3 * 86400, 80, 30 * 60),
+            }
+            snapshots = {}
+            for index, (email, (week_seconds, five_percent, five_seconds)) in enumerate(accounts.items()):
+                path = root / f"antigravity-{index}.json"
+                path.write_text(json.dumps({
+                    "type": "antigravity",
+                    "email": email,
+                    "tier": "standard-tier",
+                    "priority": 100 - index,
+                }))
+                snapshots[email] = {
+                    "tier": "standard-tier",
+                    "gemini7dRemaining": 0 if email == "weekly-empty@example.test" else 50,
+                    "gemini7dResetAt": now.timestamp() + week_seconds,
+                    "gemini5hRemaining": five_percent,
+                    "gemini5hResetAt": now.timestamp() + five_seconds,
+                }
+            (root / "quota-snapshot.json").write_text(json.dumps({
+                "updatedAt": now.isoformat(),
+                "accounts": snapshots,
+            }))
+
+            output = StringIO()
+            args = type("Args", (), {
+                "config": config,
+                "model": None,
+                "reset_hour": 0,
+                "critical_window": 2.0,
+                "refresh_tier": False,
+                "json": False,
+                "apply": False,
+            })()
+            evaluated = antigravity_pool.rebalance_antigravity_pool(
+                root, now=now, critical_window_hours=2.0
+            )
+            by_email = {item["account"]: item for item in evaluated}
+
+            self.assertEqual(evaluated[0]["account"], "short-imminent@example.test")
+            self.assertEqual(evaluated[1]["account"], "short-later@example.test")
+            self.assertEqual(evaluated[2]["account"], "weekly-first@example.test")
+            self.assertEqual(evaluated[3]["account"], "weekly-second@example.test")
+            self.assertEqual(by_email["five-hour-empty@example.test"]["status"], "FIVE_HOUR_EXHAUSTED")
+            self.assertEqual(by_email["weekly-empty@example.test"]["status"], "WEEKLY_EXHAUSTED")
+            self.assertLess(by_email["five-hour-empty@example.test"]["target_priority"], by_email["weekly-second@example.test"]["target_priority"])
+            self.assertGreater(by_email["five-hour-empty@example.test"]["target_priority"], by_email["weekly-empty@example.test"]["target_priority"])
+
+            # Exercise the apply/export contract only in this isolated temp pool.
+            args.apply = True
+            with redirect_stdout(output):
+                self.assertEqual(antigravity_pool.cmd_rebalance(args), 0)
+            pool_status = json.loads((root / "pool-status.json").read_text())
+            self.assertEqual(pool_status["primaryAccount"], "short-imminent@example.test")
+            ranking = {item["email"]: item for item in pool_status["rankings"]}
+            self.assertEqual(ranking["five-hour-empty@example.test"]["status"], "FIVE_HOUR_EXHAUSTED")
+            self.assertTrue(ranking["five-hour-empty@example.test"]["next_retry_after"])
+
 
 if __name__ == "__main__":
     unittest.main()

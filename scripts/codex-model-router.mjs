@@ -70,7 +70,7 @@ const DEFAULTS = Object.freeze({
   gptNativeBaseUrl: "https://chatgpt.com/backend-api/codex",
   authDir: `${process.env.HOME || process.env.USERPROFILE || os.homedir()}/.cli-proxy-api`,
   helper: `${process.env.HOME || process.env.USERPROFILE || os.homedir()}/.config/codex-cli-proxy/read-client-key.py`,
-  helperPython: process.env.CODEX_BRIDGE_PYTHON || process.env.PYTHON || "python3",
+  helperPython: process.env.CODEX_BRIDGE_PYTHON || process.env.PYTHON || (process.platform === "win32" ? "python" : "python3"),
   requestTimeoutMs: 120_000,
   disableGptWebSockets: true,
   antigravityRefreshLeadMs: 5 * 60 * 1000,
@@ -750,6 +750,11 @@ export function stripInternalHeaders(headers) {
   return Object.fromEntries(
     Object.entries(headers).filter(([name]) => !excluded.has(name.toLowerCase())),
   );
+}
+
+export function isExternalMode(requestOrHeaders) {
+  const headers = requestOrHeaders?.headers || requestOrHeaders || {};
+  return String(headers["x-codex-bridge-mode"] || "").trim().toLowerCase() === "external";
 }
 
 function hostHeader(url) {
@@ -1501,6 +1506,20 @@ export function createRouterServer(options = {}) {
       return;
     }
 
+    const externalMode = isExternalMode(request);
+    if (externalMode && route.upstream === "gptNative") {
+      tracker.cancel();
+      log(formatRouterLog(context, "external_mode_gpt_blocked"));
+      responseJson(response, 409, {
+        error: "gpt_unavailable_in_external_mode",
+        message: "当前处于外部模型模式，请选择 Gemini、Claude、DeepSeek、GLM 等模型。",
+        retryable: false,
+        request_id: context.requestId,
+        model: context.model,
+      });
+      return;
+    }
+
     if (route.provider === "gemini" || route.provider === "claude") {
       try {
         await ensureAntigravityAuthReady(config.authDir, {
@@ -1529,10 +1548,12 @@ export function createRouterServer(options = {}) {
     }
 
     const state = previousProviderFor(context);
+    const compactionMode = externalMode ? "drop_foreign" : config.providerSwitchCompactionMode;
+    const stateMode = externalMode ? "drop_foreign" : config.providerSwitchStateMode;
     const tSanitizeStart = performance.now();
     const prepared = sanitizeBodyForRoute(body, request.headers, route, {
-      providerSwitchCompactionMode: config.providerSwitchCompactionMode,
-      providerSwitchStateMode: config.providerSwitchStateMode,
+      providerSwitchCompactionMode: compactionMode,
+      providerSwitchStateMode: stateMode,
       previousProvider: state.provider,
     });
     const sanitizeMs = Math.max(0, performance.now() - tSanitizeStart);
@@ -1769,6 +1790,11 @@ export function createRouterServer(options = {}) {
     log(formatRouterLog(context, "upgrade"));
     if (!route) {
       socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    if (isExternalMode(request) && route.upstream === "gptNative") {
+      log(formatRouterLog(context, "external_mode_gpt_upgrade_blocked"));
+      socket.end("HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n");
       return;
     }
     if (route.upstream === "gptNative" && config.disableGptWebSockets) {

@@ -9,6 +9,7 @@
   "default_reasoning_level": "high",
   "reasoning_efforts": ["high", "max"],
   "input_modalities": ["text"],
+  "tool_mode": null,
   "supports_search_tool": false,
-  "priority": 50
+  "priority": 40
 }

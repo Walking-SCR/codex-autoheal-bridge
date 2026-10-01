@@ -76,6 +76,30 @@ def is_windows() -> bool:
 def codex_cli_candidates(application_roots: tuple[Path, ...] | None = None) -> list[str]:
     """Known CLI layouts, including Desktop bundles outside Terminal's PATH."""
     candidates = [os.environ.get("CODEX_CLI_PATH"), shutil.which("codex")]
+    if is_windows():
+        candidates.append(shutil.which("codex.cmd"))
+        candidates.append(shutil.which("codex.exe"))
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        prog_files = os.environ.get("ProgramFiles", "")
+        user_prof = os.environ.get("USERPROFILE", str(Path.home()))
+        if local_app:
+            candidates.extend([
+                str(Path(local_app) / "Programs" / "Codex" / "resources" / "codex-cli" / "bin" / "codex.exe"),
+                str(Path(local_app) / "Programs" / "Codex" / "resources" / "codex-cli" / "bin" / "codex.cmd"),
+                str(Path(local_app) / "Programs" / "ChatGPT" / "resources" / "codex-cli" / "bin" / "codex.exe"),
+                str(Path(local_app) / "Programs" / "ChatGPT" / "resources" / "codex-cli" / "bin" / "codex.cmd"),
+                str(Path(local_app) / "Microsoft" / "WindowsApps" / "codex.exe"),
+            ])
+        if prog_files:
+            candidates.extend([
+                str(Path(prog_files) / "Codex" / "resources" / "codex-cli" / "bin" / "codex.exe"),
+                str(Path(prog_files) / "ChatGPT" / "resources" / "codex-cli" / "bin" / "codex.exe"),
+            ])
+        if user_prof:
+            candidates.extend([
+                str(Path(user_prof) / "AppData" / "Roaming" / "npm" / "codex.cmd"),
+                str(Path(user_prof) / ".local" / "bin" / "codex.exe"),
+            ])
     for root in application_roots if application_roots is not None else (
         Path("/Applications"), Path.home() / "Applications"
     ):
@@ -113,6 +137,8 @@ def resolve_codex_cli(codex: str | None = None) -> str:
 
 
 def python_executable() -> str:
+    if is_windows():
+        return sys.executable or shutil.which("python") or shutil.which("py") or shutil.which("python3") or "python"
     return sys.executable or shutil.which("python3") or shutil.which("python") or "python3"
 
 
@@ -146,8 +172,22 @@ def default_proxy_binary() -> Path:
             Path("/opt/homebrew/opt/cliproxyapi/bin/cliproxyapi"),
             Path("/usr/local/opt/cliproxyapi/bin/cliproxyapi"),
         ]
-    found = discover_executable(["cliproxyapi", "cli-proxy-api", "CLIProxyAPI"], extra)
-    return found or Path("cliproxyapi")
+    elif is_windows():
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        user_prof = os.environ.get("USERPROFILE", str(Path.home()))
+        prog_files = os.environ.get("ProgramFiles", "")
+        extra = [
+            Path(user_prof) / ".cli-proxy-api" / "cliproxyapi.exe",
+            Path(user_prof) / "EasyCLIProxyAPI" / "cpa-core" / "cliproxyapi.exe",
+            Path(local_app) / "Programs" / "CLIProxyAPI" / "cliproxyapi.exe",
+        ]
+        if prog_files:
+            extra.append(Path(prog_files) / "CLIProxyAPI" / "cliproxyapi.exe")
+    found = discover_executable(
+        ["cliproxyapi", "cli-proxy-api", "CLIProxyAPI", "cliproxyapi.exe", "cli-proxy-api.exe"],
+        extra,
+    )
+    return found or Path("cliproxyapi.exe" if is_windows() else "cliproxyapi")
 
 
 def default_brew() -> Path:
@@ -2056,6 +2096,11 @@ def cmd_add_model(args: argparse.Namespace) -> None:
         subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/com.zhijian.codex-cli-model-bridge-router"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/com.zhijian.codex-cli-model-bridge-cliproxyapi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         time.sleep(1.5)
+    elif is_windows():
+        vbs_path = DEFAULT_STATE_DIR / "run-router-hidden.vbs"
+        if vbs_path.exists():
+            start_windows_proxy(vbs_path)
+            time.sleep(1.0)
 
     bridge_key = ""
     try:

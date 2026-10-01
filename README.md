@@ -27,14 +27,17 @@
 ### 🌟 核心特性
 
 1. **原生模型下拉列表集成 & Provider 感知切换**直接打通 Codex / GPT App 客户端的原生模型选择器。用户自定义添加的模型与官方 GPT 并列展示；同 Provider 可继续复用长对话，跨 Provider 遇到压缩状态或 `previous_response_id`、`rs_`、`msg_`、`fc_`、`fco_`、`item_reference` 等 Responses 状态时，由路由器提前拦截并提供“新建目标模型任务并迁移摘要 / 取消切换”选择，避免把失效引用发送到上游。
-2. **一键添加新模型（自然语言 / CLI 命令防呆）**支持一键将任意带 API Key 的模型挂载到 Codex / GPT App 模型列表中。内置“双模真机连通性探针”与“37 字段 Rust 强类型深拷贝”，彻底避免手工修改 JSON 遗漏 `support_verbosity` 等必填字段引起的解析崩溃。
-3. **双轨模型隔离（官方 GPT 绝不暴雷）**采用 8318 智能路由机制，`gpt-*` 和 `codex-*` 请求直接走官方通道，第三方模型（Gemini / Claude / DeepSeek）转发到 8317 本地代理。第三方服务或账号故障绝不影响官方 GPT 的正常使用。
-4. **休眠/关机无感自愈（告别 503）**针对 Google OAuth 访问令牌（Access Token）仅 1 小时寿命的问题，8318 路由在请求进入时自动读取本地 6 个月有效的 Refresh Token，300 毫秒内静默向 Google 换取新票并同步，休眠醒来即用。
-5. **刚唤醒网络重连容错**针对笔记本电脑开盖瞬间 Wi-Fi 正在重连的情况，内置 3 次网络自动重试机制，防止刚开机发消息由于断网而报错。
-6. **跨模型上下文安全边界**自动清洗跨 Provider 的加密思维链（Encrypted Reasoning）及 Response ID；检测到 provider-specific `type=compaction`，或跨 provider 的 `previous_response_id`、`item_reference`、`rs_`/`msg_`/`fc_`/`fco_` 项时，默认在本地阻断并进入原生下拉框后的交接流程，让用户选择“新建目标模型任务并迁移摘要”或“取消切换并继续原任务”。可用 `bridge.py provider-switch` 询问并生成 `0600` 纯文本交接包。`drop_foreign` 仍是需要显式配置的实验性降级转发，不会被自动选择；它会丢弃 provider-specific 状态但保留普通消息。
-7. **Antigravity Gemini / Claude 提示词指纹兼容**针对上游对 `You are Codex, an agent based on GPT-5.` 返回 429 的情况，8318 仅对 Antigravity 的 Gemini 和 Claude 路由改写为 `You are a helpful AI coding assistant.`；GPT、GLM、MiniMax 等其他路由不改写。为保证请求体可见，Antigravity WebSocket 会回落到 HTTP Responses。
-8. **非标 SSE 流结束符自动补齐（SSE Normalizer）**针对 MiniMax 等国产厂商在流式结束时不发送 `data: [DONE]` 导致 8317 误判断流报 503 的非标问题，8318 路由透明内置了流终结符补齐垫片，自动兼容所有非标中转站。
-9. **开箱即用与纯本地安全**
+2. **GPT 用量耗尽自动无感容灾（V2 动态双平面架构）**当 ChatGPT/Codex 官方用量耗尽、Desktop 客户端置灰“发送”按钮时，后台监控探针（控制平面）自动感应并切换至外部 Provider 模式。在外部模式下，**Gemini (3.8 Flash / 3.1 Pro / 3.7 Flash / 2.5 Pro)、Claude Sonnet 4.6、DeepSeek (V4 Pro / Flash)、GLM (5.3 Flash / 5.2) 以及 MiniMax-M3 全部非 OpenAI 模型均可同时查看与自由切换**。
+3. **显式 Header 契约与动态压缩降级**外部模式向 8318 数据平面注入 `x-codex-bridge-mode = "external"` 协议头。8318 自动启用动态 `drop_foreign` 状态脱敏，在跨第三方模型切换时安全剔除异构载荷与历史响应关联，向上游转发前剥离内部协议头，彻底根治 409 状态冲突。
+4. **4 状态生命周期状态机**解耦 `desired_mode`、`effective_mode` 与 `pending_restart`（`OPENAI_ACTIVE` -> `EXTERNAL_RESTART_REQUIRED` -> `EXTERNAL_ACTIVE` -> `OPENAI_RESTORE_PENDING` -> `OPENAI_ACTIVE`）。官方额度恢复时，仅需客户端正常重启即可生效，绝不中断正在进行的外部模型长任务。
+5. **一键添加新模型（自然语言 / CLI 命令防呆）**支持一键将任意带 API Key 的模型挂载到 Codex / GPT App 模型列表中。内置“双模真机连通性探针”与“37 字段 Rust 强类型深拷贝”，彻底避免手工修改 JSON 遗漏 `support_verbosity` 等必填字段引起的解析崩溃。
+6. **双轨模型隔离（官方 GPT 绝不暴雷）**采用 8318 智能路由机制，`gpt-*` 和 `codex-*` 请求直接走官方通道，第三方模型（Gemini / Claude / DeepSeek）转发到 8317 本地代理。第三方服务或账号故障绝不影响官方 GPT 的正常使用。
+7. **休眠/关机无感自愈（告别 503）**针对 Google OAuth 访问令牌（Access Token）仅 1 小时寿命的问题，8318 路由在请求进入时自动读取本地 6 个月有效的 Refresh Token，300 毫秒内静默向 Google 换取新票并同步，休眠醒来即用。
+8. **刚唤醒网络重连容错**针对笔记本电脑开盖瞬间 Wi-Fi 正在重连的情况，内置 3 次网络自动重试机制，防止刚开机发消息由于断网而报错。
+9. **跨模型上下文安全边界**自动清洗跨 Provider 的加密思维链（Encrypted Reasoning）及 Response ID；检测到 provider-specific `type=compaction`，或跨 provider 的 `previous_response_id`、`item_reference`、`rs_`/`msg_`/`fc_`/`fco_` 项时，默认在本地阻断并进入原生下拉框后的交接流程，让用户选择“新建目标模型任务并迁移摘要”或“取消切换并继续原任务”。可用 `bridge.py provider-switch` 询问并生成 `0600` 纯文本交接包。
+10. **Antigravity Gemini / Claude 提示词指纹兼容**针对上游对 `You are Codex, an agent based on GPT-5.` 返回 429 的情况，8318 仅对 Antigravity 的 Gemini 和 Claude 路由改写为 `You are a helpful AI coding assistant.`；GPT、GLM、MiniMax 等其他路由不改写。为保证请求体可见，Antigravity WebSocket 会回落到 HTTP Responses。
+11. **非标 SSE 流结束符自动补齐（SSE Normalizer）**针对 MiniMax 等国产厂商在流式结束时不发送 `data: [DONE]` 导致 8317 误判断流报 503 的非标问题，8318 路由透明内置了流终结符补齐垫片，自动兼容所有非标中转站。
+12. **开箱即用与纯本地安全**
    所有凭据与分流均在本地 `127.0.0.1` 环回接口运行，密钥和 OAuth 凭证不出本机。
 
 ---
@@ -95,7 +98,7 @@ git clone https://github.com/<your-username>/codex-autoheal-bridge.git ~/.codex/
 > “使用 `$codex-autoheal-bridge` 帮我一键配置并启用多模型共存网关”
 >
 > **推荐话术 2（专配 Google AI Pro 额度）**：
-> “使用 `$codex-autoheal-bridge` 帮我一键配置 Google AI Pro (Gemini 3.8/3.7/3.6/3.1) 系列模型接入”
+> “使用 `$codex-autoheal-bridge` 帮我一键配置 Google AI Pro (Gemini 3.8/3.7/3.1/2.5) 系列模型接入”
 
 *(触发机制说明：只要在你的输入中包含 `$codex-autoheal-bridge` 标签，Codex 调度器就会必定激活本 Skill。Skill 启动时会**首先提示你确认当前操作系统（macOS / Windows）**，确认后自动执行环境审计、部署对应系统的无感后台自愈网关并安全写入配置。完成后只需重启 Codex Desktop 即可直接使用！)*
 
@@ -110,6 +113,14 @@ python3 ~/.codex/skills/codex-autoheal-bridge/scripts/bridge.py configure-deskto
 ```bash
 python %USERPROFILE%\.codex\skills\codex-autoheal-bridge\scripts\bridge.py configure-desktop --platform windows --apply
 ```
+
+#### 选项 C：Windows 用户双击脚本一键配置（免终端最简方案）
+
+在 Windows 文件资源管理器中进入本 Skill 目录的 `scripts\` 文件夹：
+- **一键配置与开机隐形常驻**：直接双击 **`setup_windows.cmd`**，自动完成环境检测、8318 路由部署、开机静默自启注册与模型列表同步；
+- **双模极速切换**：日常官方额度耗尽需要临时切到外部多模型（或额度恢复后切回）时，直接双击 **`toggle_mode.cmd`**，一键完成来回切换并自动平滑重启生效。
+
+详见专门整理的 [Windows 平台完整适配与使用指南](references/windows.md)。
 
 该命令会自动完成跨平台无感常驻：
 
@@ -209,7 +220,7 @@ openai-compatibility:
       - api-key: "你的DeepSeek_API_KEY"
     models:
       - name: "deepseek-chat"
-        alias: "deepseek-v4-flash"
+        alias: "deepseek-flash"
       - name: "deepseek-reasoner"
         alias: "deepseek-v4-pro"
 ```
@@ -256,6 +267,17 @@ routing:
 后，CLIProxyAPI 会在同一请求中尝试账号 B；长对话通过 session affinity
 保持账号粘滞，避免频繁切换导致上游 Prompt Cache 丢失。`audit` 只输出脱敏
 标识，不输出邮箱、Access Token 或 Refresh Token。
+
+账号池重排使用 `antigravity_pool.py rebalance --apply`。排序规则为：先把有
+7 天剩余额度的账号放在可用组内，并按 7 天重置剩余时间从短到长排序；周窗口
+相同时（或参与排序的周重置时间均未知时），再优先 5 小时窗口将在默认 2 小时内重置的账号；套餐等级和原有
+`priority` 只用于后续平局。5 小时剩余为 0 的账号即使周额度尚有余额，也会标记为
+`FIVE_HOUR_EXHAUSTED` 并排在可用账号之后，周额度为 0 的账号标记为
+`WEEKLY_EXHAUSTED`；禁用/需验证账号仍是 `BLOCKED`、优先级 0。账号状态和重置时间
+通过 `pool-status.json` 提供给用量插件显示。插件的“重排”按钮会应用此排序，执行前
+会备份发生变化的凭证文件。若某账号没有 7 天重置时间，它排在重置时间已知的可用账号之后；周重置时间同样未知时，再用 5 小时规则排序。缺少 5 小时剩余量时不会推断为耗尽。
+
+启用 CLIProxyAPI `session-affinity` 时，新会话或未绑定请求会按新优先级选择账号；已有会话仍保持粘滞，直到代理观察到原账号进入冷却或不可用。重排不会强制清除正在使用的会话绑定。
 
 配置变更前会生成 `0600` 备份；完成登录后应重启 8317 并验证：两个凭据均
 已加载、正常请求命中主账号、主账号进入冷却后备用账号返回 200、两者都不可
@@ -305,6 +327,97 @@ python3 ~/.codex/skills/codex-autoheal-bridge/scripts/auto_sync_official.py --ap
 ```
 
 账号目录返回 403 时不将其解释为“账号没有该模型”；如果 Codex 探测也失败，同步器保持下拉框不变。成功写入后，桌面客户端可能需要新建任务或重新加载才能刷新下拉框。此同步只处理官方模型，不修改第三方条目；`bridge.py sync` 是独立的隔离 profile 目录工作流。
+
+---
+
+## GPT 配额耗尽自动切外部模型 / 恢复后自动切回
+
+当 Codex Desktop 因 ChatGPT/Codex included usage 耗尽而把 Send 置灰时，可使用 `scripts/quota_failover.py` 临时切到 `cli_proxy`（`requires_openai_auth=false`），继续使用 Gemini / Claude / DeepSeek / GLM / MiniMax / Qwen 等外部模型。脚本会通过 Codex 官方 app-server 的 `account/rateLimits/read` 记录真正的阻塞窗口和 `resetsAt`，恢复后再验证 `ordinaryUsageAllowed=true` 且主限制窗口低于 100%，然后自动恢复进入 External Mode 前的 OpenAI 透明路由配置。
+
+### ⚡ 模式切换与极速双向切换命令
+
+- **极速双向切换（Toggle，推荐）：**
+  只需一条命令，**每一次执行都会在「OpenAI 官方模式」与「外部模型模式」之间自动来回交替切换并重启生效**：
+
+  ```bash
+  python3 ~/.codex/skills/codex-autoheal-bridge/scripts/quota_failover.py toggle --apply --restart
+  ```
+  *(注：如果当前在 OpenAI 模式，执行后切到外部模式；如果当前在外部模式，执行后切回 OpenAI 模式。)*
+
+- **显式切到外部模式（External Mode）：**
+  ```bash
+  python3 ~/.codex/skills/codex-autoheal-bridge/scripts/quota_failover.py external-mode --apply --restart
+  ```
+
+- **显式切回官方模式（OpenAI Mode）：**
+  ```bash
+  python3 ~/.codex/skills/codex-autoheal-bridge/scripts/quota_failover.py openai-mode --apply --restart
+  ```
+
+- **查看真实额度与恢复时间：**
+  ```bash
+  python3 ~/.codex/skills/codex-autoheal-bridge/scripts/quota_failover.py quota-status --live
+  ```
+
+详见 `README_QUOTA_FAILOVER.md`。
+
+如需双向自动切换，可先预览 `quota_failover.py auto-mode --model <已验证的备用模型>`，确认备用模型、后台监控及临时历史显示范围变化后再加 `--apply`。监控在 GPT 额度耗尽后配置外部模式，额度恢复后配置回原模式，并继续监控后续周期；两个方向都不自动重启运行中的应用。停止使用 `stop-auto --apply`，不会改动当前模式。操作边界详见 [quota-failover runbook](references/quota-failover.md)。
+
+### 自动切换失败时：手动切换命令（macOS）
+
+以下命令可在任意目录执行。默认只改配置，不会退出应用；先完成当前任务，再完全退出并重新打开桌面应用，让新配置生效。切换到外部 Provider 后，原 OpenAI 任务可能暂时不显示，但不会被删除；切回原 Provider 后恢复其历史显示范围。已有任务的模型和上下文不会自动迁移。
+
+**1. 先停止双向自动监控，避免它把你的手动选择切回去：**
+
+```bash
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/quota_failover.py stop-auto --apply
+```
+
+此命令保留当前模式。如果以前只启用了单向恢复 watcher，额外执行下面一条，卸载同一个额度监控任务；不会停止 8317/8318 模型代理。提示任务未加载时可跳过，不要删除路由配置或授权文件。
+
+```bash
+/bin/launchctl bootout "gui/$(id -u)/com.zhijian.codex-cli-model-bridge-quota"
+```
+
+**2. GPT 额度耗尽时，手动切到外部模型模式：**
+
+下面以 `deepseek-v4-pro` 为例，仅在它的路由已验证可用时使用；也可把模型 ID 替换为你已验证的备用模型。不是自动推荐或随机选择模型。
+
+```bash
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/quota_failover.py external-mode --model deepseek-v4-pro --no-watch
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/quota_failover.py external-mode --model deepseek-v4-pro --apply --no-watch
+```
+
+第一条预览，第二条应用。`--no-watch` 不安装新的后台 watcher；不带 `--restart`，因此不会自动重启应用。成功后请手动重启，确认外部模型可发送请求。
+
+**3. GPT 额度恢复后，手动切回原正常模式：**
+
+```bash
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/quota_failover.py openai-mode
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/quota_failover.py openai-mode --apply
+```
+
+第一条预览，第二条应用，再手动重启应用。恢复的是进入外部模式前保存的 Provider、默认模型、路由地址和模型目录，不覆盖 MCP 等其它配置；不保证原默认模型一定是 GPT。GPT 额度尚未恢复时，切回也不能绕过服务端额度限制。
+
+**4. 如果希望命令顺便重启（会退出应用，请先完成任务）：**
+
+```bash
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/quota_failover.py external-mode --model deepseek-v4-pro --apply --no-watch --restart
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/quota_failover.py openai-mode --apply --restart
+```
+
+这两条是不同方向的替代命令，按需要选一条，**不要连续执行**。若输出 `codex_restarted=false`，请手动重启；脚本不会强杀应用，也不会猜测独立 CLI 对应哪个桌面应用。
+
+**5. 查看实时额度或当前状态：**
+
+```bash
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/quota_failover.py quota-status --live
+python3 ~/.codex/skills/codex-autoheal-bridge/scripts/quota_failover.py quota-status
+```
+
+`--live` 失败或 `quota_source=cached` 时，不要把缓存当成实时额度。手动切换适用于监控没有触发或后台任务失效；如果 CLI 找不到、授权异常或实时额度读取失败，`external-mode --apply` 仍会停止写入配置，需先修复对应问题。`openai-mode` 若提示没有保存的 OpenAI 配置，或路由字段被手动修改而拒绝恢复，请保留状态与备份核对，不要删除状态文件或强行覆盖整个 `config.toml`。
+
+需要恢复双向监控时，重新预览并明确启用 `auto-mode --model <已验证的备用模型> --apply`，不要在手动排障期间重新开启。
 
 ---
 
@@ -423,7 +536,7 @@ Simply send either of the following prompts in any Codex Desktop task to trigger
 > "Use $codex-autoheal-bridge to automatically configure and enable the multi-model gateway."
 >
 > *(Or specifically for Google AI Pro)*:
-> "Use $codex-autoheal-bridge to configure Google AI Pro (Gemini 3.8/3.7/3.6/3.1) models into Codex."
+> "Use $codex-autoheal-bridge to configure Google AI Pro (Gemini 3.8/3.7/3.1/2.5) models into Codex."
 
 #### Option B: One-Line Terminal Command
 

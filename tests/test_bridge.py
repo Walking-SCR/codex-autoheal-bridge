@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "bridge.py"
@@ -592,9 +593,9 @@ class BridgeTests(unittest.TestCase):
                 encoding="utf-8",
             )
             native.write_text(json.dumps({"models": [native_template()]}), encoding="utf-8")
-            manual_grok = native_template()
-            manual_grok.update({"slug": "grok-4.6", "display_name": "manual"})
-            target.write_text(json.dumps({"models": [native_template(), manual_grok]}), encoding="utf-8")
+            manual_claude = native_template()
+            manual_claude.update({"slug": "claude-sonnet-4-6", "display_name": "manual"})
+            target.write_text(json.dumps({"models": [native_template(), manual_claude]}), encoding="utf-8")
             base = (
                 "sync",
                 "--config",
@@ -609,7 +610,7 @@ class BridgeTests(unittest.TestCase):
             )
             blocked = run_bridge(*base)
             self.assertEqual(blocked.returncode, 2)
-            self.assertEqual(json.loads(blocked.stdout)["conflicts"], ["grok-4.6"])
+            self.assertEqual(json.loads(blocked.stdout)["conflicts"], ["claude-sonnet-4-6"])
             applied = run_bridge(*base, "--adopt", "--apply")
             self.assertEqual(applied.returncode, 0, applied.stderr or applied.stdout)
             payload = json.loads(applied.stdout)
@@ -617,7 +618,19 @@ class BridgeTests(unittest.TestCase):
             slugs = {item["slug"] for item in json.loads(target.read_text())["models"]}
             self.assertEqual(
                 slugs,
-                {"gpt-5.6-sol", "grok-4.6", "deepseek-v4-pro", "deepseek-v4-flash", "gemini-3.7-flash-high", "gemini-3.8-flash-high"},
+                {
+                    "gpt-5.6-sol",
+                    "claude-sonnet-4-6",
+                    "deepseek-v4-pro",
+                    "deepseek-flash",
+                    "gemini-2.5-pro",
+                    "gemini-3.7-flash-high",
+                    "gemini-3.8-flash-high",
+                    "gemini-3.1-pro",
+                    "glm-5.2",
+                    "glm-5.3-flash",
+                    "minimax-m3",
+                },
             )
             again = run_bridge(*base, "--apply")
             self.assertEqual(again.returncode, 0, again.stderr or again.stdout)
@@ -760,6 +773,21 @@ class BridgeTests(unittest.TestCase):
             startup_text = startup_file.read_text(encoding="utf-8")
             self.assertIn('WshShell.Run Chr(34) & "' + str(vbs_file) + '" & Chr(34), 0, False', startup_text)
 
+    def test_windows_codex_cli_candidates_and_proxy_binary(self) -> None:
+        module_spec = __import__("importlib.util").util.spec_from_file_location("bridge", SCRIPT)
+        module = __import__("importlib.util").util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+
+        with mock.patch.object(module, "is_windows", return_value=True), \
+             mock.patch.object(module.shutil, "which", return_value=None), \
+             mock.patch.dict(os.environ, {"LOCALAPPDATA": "C:\\Users\\test\\AppData\\Local", "USERPROFILE": "C:\\Users\\test"}):
+            candidates = module.codex_cli_candidates()
+            self.assertTrue(any("Codex" in c and "codex.exe" in c for c in candidates))
+            self.assertTrue(any("ChatGPT" in c and "codex.exe" in c for c in candidates))
+
+            bin_path = module.default_proxy_binary()
+            self.assertEqual(bin_path.name, "cliproxyapi.exe")
+
     def test_configure_desktop_windows_planned_and_applied(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -846,6 +874,49 @@ class BridgeTests(unittest.TestCase):
             self.assertIn('model_provider = "openai"', cfg_text)
             self.assertIn('openai_base_url = "http://127.0.0.1:8318/v1"', cfg_text)
             self.assertIn('model_catalog_json = "' + str(catalog) + '"', cfg_text)
+
+    def test_is_router_supported_supports_grok_zai_custom(self) -> None:
+        module_spec = __import__("importlib.util").util.spec_from_file_location("bridge", SCRIPT)
+        module = __import__("importlib.util").util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+
+        for slug in ("grok-4.6", "grok-beta", "zai-pro", "custom-fast-llm", "deepseek-flash", "claude-sonnet-4-6"):
+            self.assertTrue(module.is_router_supported(slug), f"slug {slug} should be router supported")
+
+    def test_add_model_yaml_insertion_under_openai_compatibility(self) -> None:
+        module_spec = __import__("importlib.util").util.spec_from_file_location("bridge", SCRIPT)
+        module = __import__("importlib.util").util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            proxy_config = root / "config.yaml"
+            proxy_config.write_text(
+                "openai-compatibility:\n  - name: existing\n    base-url: http://example.com\ncodex:\n  optimize-multi-agent-v2: true\n",
+                encoding="utf-8",
+            )
+            content = proxy_config.read_text(encoding="utf-8")
+            slug = "my-special-model"
+            if not module.is_router_supported(slug):
+                slug = f"custom-{slug}"
+            self.assertEqual(slug, "custom-my-special-model")
+
+            new_block = f"""  - name: "custom"
+    base-url: "http://example.com"
+    api-key-entries:
+      - api-key: "secret"
+    models:
+      - name: "my-special-model"
+        alias: "{slug}"
+"""
+            pattern = r"(?m)^(openai-compatibility:\s*\n)"
+            match = module.re.search(pattern, content)
+            self.assertIsNotNone(match)
+            insert_pos = match.end()
+            content = content[:insert_pos] + new_block + content[insert_pos:]
+
+            # Verify new_block is before codex:
+            self.assertTrue(content.index(slug) < content.index("codex:"))
 
 
 if __name__ == "__main__":
