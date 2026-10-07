@@ -274,10 +274,22 @@ def calculate_account_priority(
 
     cooling_until: datetime | None = None
     cooling_reason: str = ""
+    target_model = model.strip() if model and isinstance(model, str) and model.strip() else None
+
     for r in status_records:
         r_model = str(r.get("model", "")).strip()
-        if model and r_model and r_model.casefold() != model.casefold():
-            continue
+        if target_model:
+            target_cf = target_model.casefold()
+            r_cf = r_model.casefold()
+            if r_model and r_cf != target_cf and not (target_cf in r_cf or r_cf.startswith(target_cf)):
+                continue
+        else:
+            # 未显式指定模型时，排权基准以核心模型 Gemini 为主。
+            # 若 cooling 仅针对非核心辅助模型（如 claude-*），且该账号 Gemini 配额充足，不应误判为全盘 COOLING
+            r_cf = r_model.casefold()
+            is_gemini_record = "gemini" in r_cf
+            if not is_gemini_record and r_model and (five_hour_remaining is None or five_hour_remaining > 0):
+                continue
         if str(r.get("status", "")).casefold() == "cooling":
             rec_time = parse_iso_datetime(r.get("next_retry_after") or r.get("quota", {}).get("next_recover_at"))
             if not rec_time:

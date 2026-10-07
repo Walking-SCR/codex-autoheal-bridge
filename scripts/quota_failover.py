@@ -160,6 +160,7 @@ def load_state(path: Path) -> dict[str, Any]:
 def save_state(path: Path, state: dict[str, Any]) -> None:
     payload = dict(state)
     payload["schema_version"] = STATE_VERSION
+    payload["state_machine"] = compute_lifecycle_state(payload)
     bridge.atomic_write(
         path,
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -856,18 +857,30 @@ def apply_external_mode(
         raise RuntimeError(f"bridge catalog is missing: {source_catalog}")
 
     is_manual_toggle = bool(getattr(args, "toggle", False) or getattr(args, "command", "") in ("toggle", "toggle-mode"))
-    allow_quota_error = is_manual_toggle or not args.apply
-    state, analysis = quota_result if quota_result is not None else refresh_state(
-        state_path, args.codex, allow_error=allow_quota_error, persist=args.apply
-    )
+    if quota_result is not None:
+        state, analysis = quota_result
+    elif is_manual_toggle:
+        # 方案1优化：手动切换模式直接复用本地已有快照，解除对远程网络 app-server 查询的同步阻塞
+        state = load_state(state_path)
+        analysis = state.get("last_analysis")
+    else:
+        state, analysis = refresh_state(
+            state_path, args.codex, allow_error=not args.apply, persist=args.apply
+        )
     active_provider = config.get("model_provider", "openai")
     if active_provider != "openai" and not (
         active_provider == EXTERNAL_PROVIDER_ID and state.get("mode") == "external"
     ):
         raise RuntimeError("external mode requires the OpenAI baseline or an existing managed external mode")
     original = state.get("openai_config")
+    saved_model = original.get("model", {}).get("value") if isinstance(original, dict) else None
+    if saved_model and is_external_slug(str(saved_model)):
+        original = None
     if state.get("mode") != "external" or not isinstance(original, dict):
         original = capture_openai_config(config)
+        captured_model = original.get("model", {}).get("value")
+        if captured_model and is_external_slug(str(captured_model)):
+            original["model"] = {"present": True, "value": "gpt-6.1-sol"}
 
     external_payload, external_catalog_str = prepare_external_catalog(
         source_catalog, state_dir, external_catalog, apply=False
@@ -1011,6 +1024,8 @@ def restore_openai_mode(
         item = saved.get(key)
         if not isinstance(item, dict):
             raise RuntimeError(f"saved OpenAI config is missing {key}")
+        if key == "model" and item.get("value") and is_external_slug(str(item.get("value"))):
+            item = {"present": True, "value": "gpt-6.1-sol"}
         updated = _restore_root_value(updated, key, item)
 
     result: dict[str, Any] = {
