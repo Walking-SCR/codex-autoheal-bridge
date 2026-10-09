@@ -581,6 +581,36 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(again.returncode, 0, again.stderr or again.stdout)
             self.assertEqual(json.loads(again.stdout)["status"], "unchanged")
 
+    def test_configure_multi_agent_uses_v8_client_codex_path(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            proxy_config = Path(raw) / "cliproxyapi-v8.yaml"
+            proxy_config.write_text(
+                'config-version: 8\napi-keys:\n  - "fixture-secret"\nclient:\n  codex:\n    optimize-multi-agent-v2: false\n    enable-apply-patch: true\n',
+                encoding="utf-8",
+            )
+            base = ("configure-multi-agent", "--proxy-config", str(proxy_config), "--skip-restart")
+            preview = run_bridge(*base)
+            self.assertEqual(preview.returncode, 0, preview.stderr or preview.stdout)
+            preview_payload = json.loads(preview.stdout)
+            self.assertEqual(preview_payload["status"], "planned")
+            self.assertIn("optimize-multi-agent-v2: true", preview_payload["diff"])
+            self.assertNotIn("fixture-secret", preview_payload["diff"])
+
+            applied = run_bridge(*base, "--expected-sha256", preview_payload["config_sha256"], "--apply")
+            self.assertEqual(applied.returncode, 0, applied.stderr or applied.stdout)
+            updated = proxy_config.read_text(encoding="utf-8")
+            self.assertIn("client:\n  codex:\n    optimize-multi-agent-v2: true\n", updated)
+            self.assertIn("enable-apply-patch: true", updated)
+            self.assertNotIn("\ncodex:\n", updated, "v8 writes must not create a competing legacy root section")
+
+            module_spec = __import__("importlib.util").util.spec_from_file_location("bridge_v8_test", SCRIPT)
+            module = __import__("importlib.util").util.module_from_spec(module_spec)
+            module_spec.loader.exec_module(module)
+            self.assertTrue(module.cli_proxy_multi_agent_v2(updated))
+            self.assertFalse(module.cli_proxy_multi_agent_v2(
+                "config-version: 8\nclient:\n  codex:\n    optimize-multi-agent-v2: false\ncodex:\n  optimize-multi-agent-v2: true\n"
+            ), "canonical v8 value must win over a legacy value")
+
     def test_sync_requires_adoption_then_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

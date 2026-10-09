@@ -536,7 +536,7 @@ python3 <skill-dir>/scripts/bridge.py configure-multi-agent \
   --apply
 ```
 
-This changes only `codex.optimize-multi-agent-v2` to `true`, creates a `0600` backup, restarts CLIProxyAPI when a macOS Homebrew service exists, and waits for the transparent route to recover. On Windows, tell the user to restart CLIProxyAPI locally if the live `/v1/models` check does not recover. The transform is gated to official Codex user agents. For xAI, it converts `agent_message` into a standard user `message`, normalizes its encrypted content wrapper, and leaves normal OpenAI history/provider identity untouched.
+This changes only the Codex multi-agent compatibility flag, creates a `0600` backup, restarts CLIProxyAPI when a macOS Homebrew service exists, and waits for the transparent route to recover. The helper writes the legacy root `codex.optimize-multi-agent-v2` path for v7/implicit legacy configs and the canonical `client.codex.optimize-multi-agent-v2` path for v8 configs; audit reads the canonical v8 value first. A v8 upgrade does not enable this option automatically. On Windows, tell the user to restart CLIProxyAPI locally if the live `/v1/models` check does not recover. The transform is gated to official Codex user agents. For xAI, it converts `agent_message` into a standard user `message`, normalizes its encrypted content wrapper, and leaves normal OpenAI history/provider identity untouched.
 
 Verify the exact failing shape, then run the normal Codex probe:
 

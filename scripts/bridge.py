@@ -685,6 +685,88 @@ def yaml_section_bool(text: str, section: str, key: str) -> bool | None:
     return None
 
 
+def yaml_path_bool(text: str, path: tuple[str, ...]) -> bool | None:
+    """Read a boolean nested below YAML mapping keys without exposing file contents."""
+    lines = text.splitlines()
+    stack: list[tuple[int, str]] = []
+    mapping = re.compile(r"^(\s*)([A-Za-z0-9_-]+):(?:\s*(.*))?$")
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = mapping.match(line)
+        if not match:
+            continue
+        indent = len(match.group(1))
+        key = match.group(2)
+        value = (match.group(3) or "").strip()
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        current_path = tuple([name for _, name in stack] + [key])
+        if current_path == path:
+            boolean = re.fullmatch(r"(true|false)\s*(?:#.*)?", value, re.IGNORECASE)
+            return boolean.group(1).lower() == "true" if boolean else None
+        if not value or value.startswith("#"):
+            stack.append((indent, key))
+    return None
+
+
+def replace_yaml_path_bool(text: str, path: tuple[str, ...], value: bool) -> str:
+    """Set client.codex.<key> in v8 YAML while preserving all unrelated text."""
+    if path != ("client", "codex", "optimize-multi-agent-v2"):
+        raise ValueError("unsupported CLIProxyAPI v8 boolean path")
+    lines = text.splitlines(keepends=True)
+    rendered = "true" if value else "false"
+
+    def mapping_start(key: str, indent: int, start: int, end: int) -> int | None:
+        pattern = re.compile(rf"^\s{{{indent}}}{re.escape(key)}:\s*(?:#.*)?$")
+        return next((index for index in range(start, end) if pattern.match(lines[index].rstrip("\n"))), None)
+
+    def mapping_end(start: int, indent: int, end: int) -> int:
+        for index in range(start + 1, end):
+            line = lines[index]
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if len(line) - len(line.lstrip()) <= indent:
+                return index
+        return end
+
+    client_start = mapping_start("client", 0, 0, len(lines))
+    if client_start is None:
+        suffix = "" if not text or text.endswith("\n") else "\n"
+        return f"{text}{suffix}client:\n  codex:\n    optimize-multi-agent-v2: {rendered}\n"
+    client_end = mapping_end(client_start, 0, len(lines))
+    codex_start = mapping_start("codex", 2, client_start + 1, client_end)
+    if codex_start is None:
+        lines[client_end:client_end] = ["  codex:\n", f"    optimize-multi-agent-v2: {rendered}\n"]
+        return "".join(lines)
+
+    codex_end = mapping_end(codex_start, 2, client_end)
+    key_pattern = re.compile(r"^(\s+)optimize-multi-agent-v2:\s*(?:true|false)\s*(?:#.*)?$", re.IGNORECASE)
+    for index in range(codex_start + 1, codex_end):
+        match = key_pattern.match(lines[index].rstrip("\n"))
+        if match:
+            lines[index] = f"{match.group(1)}optimize-multi-agent-v2: {rendered}\n"
+            return "".join(lines)
+    lines[codex_end:codex_end] = [f"    optimize-multi-agent-v2: {rendered}\n"]
+    return "".join(lines)
+
+
+def cli_proxy_multi_agent_v2(text: str) -> bool | None:
+    # Canonical v8 configuration wins; fall back to the accepted v7/legacy key.
+    canonical = yaml_path_bool(text, ("client", "codex", "optimize-multi-agent-v2"))
+    return canonical if canonical is not None else yaml_section_bool(text, "codex", "optimize-multi-agent-v2")
+
+
+def set_cli_proxy_multi_agent_v2(text: str, value: bool) -> str:
+    version_match = re.search(r"(?m)^config-version:\s*(\d+)\s*(?:#.*)?$", text)
+    if (version_match and int(version_match.group(1)) >= 8) or yaml_path_bool(
+        text, ("client", "codex", "optimize-multi-agent-v2")
+    ) is not None:
+        return replace_yaml_path_bool(text, ("client", "codex", "optimize-multi-agent-v2"), value)
+    return replace_yaml_section_bool(text, "codex", "optimize-multi-agent-v2", value)
+
+
 def replace_provider_block(text: str, provider_id: str, block: str) -> str:
     lines = text.splitlines(keepends=True)
     root = f"model_providers.{provider_id}"
@@ -1086,7 +1168,7 @@ def cmd_configure_multi_agent(args: argparse.Namespace) -> None:
             },
             2,
         )
-    updated = replace_yaml_section_bool(current, "codex", "optimize-multi-agent-v2", True)
+    updated = set_cli_proxy_multi_agent_v2(current, True)
     changed = updated != current
     result = {
         "status": "planned" if not args.apply else "unchanged",
@@ -1106,7 +1188,7 @@ def cmd_configure_multi_agent(args: argparse.Namespace) -> None:
         atomic_write(proxy_config, updated, 0o600)
         result["status"] = "applied"
     verified = proxy_config.read_text(encoding="utf-8")
-    if yaml_section_bool(verified, "codex", "optimize-multi-agent-v2") is not True:
+    if cli_proxy_multi_agent_v2(verified) is not True:
         emit({"status": "blocked", "error": "post-write multi-agent compatibility verification failed"}, 2)
     if not args.skip_restart:
         restart_error = None
@@ -1366,9 +1448,7 @@ def cmd_audit(args: argparse.Namespace) -> None:
     auth, auth_error = chatgpt_auth_state(Path(args.auth_file).expanduser())
     proxy_config_path = Path(args.proxy_config).expanduser()
     try:
-        proxy_multi_agent_compat = yaml_section_bool(
-            proxy_config_path.read_text(encoding="utf-8"), "codex", "optimize-multi-agent-v2"
-        )
+        proxy_multi_agent_compat = cli_proxy_multi_agent_v2(proxy_config_path.read_text(encoding="utf-8"))
     except OSError:
         proxy_multi_agent_compat = None
     findings: list[str] = []
