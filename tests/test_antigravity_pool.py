@@ -317,6 +317,59 @@ class AntigravityPoolTests(unittest.TestCase):
             self.assertEqual(ranking["five-hour-empty@example.test"]["status"], "FIVE_HOUR_EXHAUSTED")
             self.assertTrue(ranking["five-hour-empty@example.test"]["next_retry_after"])
 
+    def test_secondary_model_generic_mirror_does_not_mask_healthy_gemini(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(f"auth-dir: {root}\n")
+            from datetime import datetime, timezone
+            now = datetime(2026, 10, 10, 12, 0, 0, tzinfo=timezone.utc)
+
+            # Account with positive Gemini quota but Claude 429 cooling with generic mirror
+            (root / "antigravity-user@example.test.json").write_text(json.dumps({
+                "type": "antigravity",
+                "email": "user@example.test",
+                "tier": "standard-tier",
+                "priority": 100,
+            }))
+            (root / "quota-snapshot.json").write_text(json.dumps({
+                "updatedAt": now.isoformat(),
+                "accounts": {
+                    "user@example.test": {
+                        "tier": "standard-tier",
+                        "gemini5hRemaining": 90,
+                        "gemini5hResetSeconds": 14400,
+                        "gemini7dRemaining": 50,
+                        "gemini7dResetSeconds": 300000,
+                    }
+                }
+            }))
+            (root / "antigravity-user_example.test.cds").write_text(json.dumps({
+                "provider": "antigravity",
+                "records": [
+                    {
+                        "auth_id": "antigravity-user@example.test.json",
+                        "status": "cooling",
+                        "next_retry_after": "2026-10-10T15:00:00Z",
+                        "reason": "quota",
+                    },
+                    {
+                        "auth_id": "antigravity-user@example.test.json",
+                        "model": "claude-sonnet-4-6",
+                        "status": "cooling",
+                        "next_retry_after": "2026-10-10T15:00:00Z",
+                        "reason": "quota",
+                    }
+                ]
+            }))
+
+            evaluated = antigravity_pool.rebalance_antigravity_pool(
+                root, model="gemini-3.8-flash-high", now=now
+            )
+            by_email = {item["account"]: item for item in evaluated}
+            self.assertEqual(by_email["user@example.test"]["status"], "ACTIVE")
+            self.assertEqual(by_email["user@example.test"]["target_priority"], 900)
+
 
 if __name__ == "__main__":
     unittest.main()

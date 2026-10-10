@@ -275,20 +275,45 @@ def calculate_account_priority(
     cooling_until: datetime | None = None
     cooling_reason: str = ""
     target_model = model.strip() if model and isinstance(model, str) and model.strip() else None
+    target_cf = target_model.casefold() if target_model else "gemini"
+
+    non_target_cooling_times: set[str] = set()
+    non_target_cooling_epochs: set[int] = set()
+    for r in status_records:
+        r_m = str(r.get("model", "")).strip().casefold()
+        is_target = (target_cf in r_m or r_m.startswith(target_cf)) if target_model else ("gemini" in r_m)
+        if r_m and not is_target and str(r.get("status", "")).casefold() == "cooling":
+            rec_str = str(r.get("next_retry_after") or r.get("quota", {}).get("next_recover_at") or "").strip()
+            if rec_str:
+                non_target_cooling_times.add(rec_str)
+            dt = parse_iso_datetime(r.get("next_retry_after") or r.get("quota", {}).get("next_recover_at"))
+            if dt:
+                non_target_cooling_epochs.add(int(dt.timestamp()))
+
+    has_gemini_remaining = (five_hour_remaining is None or five_hour_remaining > 0)
 
     for r in status_records:
         r_model = str(r.get("model", "")).strip()
+        rec_time_str = str(r.get("next_retry_after") or r.get("quota", {}).get("next_recover_at") or "").strip()
+        r_dt = parse_iso_datetime(r.get("next_retry_after") or r.get("quota", {}).get("next_recover_at"))
+        r_epoch = int(r_dt.timestamp()) if r_dt else None
+        is_mirror_of_non_target = not r_model and (rec_time_str in non_target_cooling_times or (r_epoch is not None and r_epoch in non_target_cooling_epochs))
+
         if target_model:
             target_cf = target_model.casefold()
             r_cf = r_model.casefold()
             if r_model and r_cf != target_cf and not (target_cf in r_cf or r_cf.startswith(target_cf)):
+                continue
+            if is_mirror_of_non_target and has_gemini_remaining:
                 continue
         else:
             # 未显式指定模型时，排权基准以核心模型 Gemini 为主。
             # 若 cooling 仅针对非核心辅助模型（如 claude-*），且该账号 Gemini 配额充足，不应误判为全盘 COOLING
             r_cf = r_model.casefold()
             is_gemini_record = "gemini" in r_cf
-            if not is_gemini_record and r_model and (five_hour_remaining is None or five_hour_remaining > 0):
+            if not is_gemini_record and r_model and has_gemini_remaining:
+                continue
+            if is_mirror_of_non_target and has_gemini_remaining:
                 continue
         if str(r.get("status", "")).casefold() == "cooling":
             rec_time = parse_iso_datetime(r.get("next_retry_after") or r.get("quota", {}).get("next_recover_at"))
